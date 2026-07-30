@@ -1,0 +1,15 @@
+{
+  "name": "lindner-fireworks-backend",
+  "version": "1.0.0",
+  "description": "Kleiner Bestell-Server für den Lindner Fireworks Shop: echter Lagerbestand, automatische Bestell-E-Mails (Kunde + Lukas). Bewusst ganz ohne externe Pakete gebaut (nur Node.js-Bordmittel) – einfacher zu hosten, weniger, das kaputtgehen kann.",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "seed": "node src/seedProducts.js"
+  },
+  "dependencies": {}
+}
