@@ -133,6 +133,35 @@ async function handlePostOrder(req, res) {
   sendJson(res, 200, { ok: true, order, emails: { customerMailResult, ownerMailResult } });
 }
 
+// ---------- Admin: manuelle Bestandskorrektur (z.B. bei Stornierung) ----------
+// Nur per GET aufrufbar (bewusst so gebaut, damit Claude das direkt selbst
+// aufrufen kann, ohne dass du erst wieder Dateien hochladen musst) und nur
+// mit dem geheimen ADMIN_KEY (als Umgebungsvariable in Railway gesetzt, nicht
+// im Code). Ohne gesetzten ADMIN_KEY ist dieser Endpunkt komplett deaktiviert.
+async function handleAdminAdjustStock(req, res, url) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) {
+    return sendJson(res, 503, { ok: false, error: "admin_disabled" });
+  }
+  if (url.searchParams.get("key") !== adminKey) {
+    return sendJson(res, 401, { ok: false, error: "unauthorized" });
+  }
+
+  const id = url.searchParams.get("id");
+  const delta = parseInt(url.searchParams.get("delta"), 10);
+  if (!id || Number.isNaN(delta) || delta === 0) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request" });
+  }
+
+  const result =
+    delta > 0
+      ? await store.incrementStock(id, delta)
+      : await store.decrementStock(id, -delta);
+
+  if (!result.ok) return sendJson(res, 409, result);
+  sendJson(res, 200, { ok: true, id, remaining: result.remaining });
+}
+
 const server = http.createServer(async (req, res) => {
   setCorsHeaders(res);
 
@@ -154,6 +183,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/order") {
       return await handlePostOrder(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/adjust-stock") {
+      return await handleAdminAdjustStock(req, res, url);
     }
 
     sendJson(res, 404, { ok: false, error: "not_found" });
