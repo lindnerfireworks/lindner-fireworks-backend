@@ -16,7 +16,16 @@ const http = require("http");
 const crypto = require("crypto");
 
 const store = require("./store");
-const { sendCustomerConfirmation, sendOwnerNotification } = require("./email");
+const {
+  sendCustomerConfirmation,
+  sendOwnerNotification,
+  sendContactNotification,
+  sendContactConfirmation,
+  sendBookingNotification,
+  sendBookingConfirmation,
+  computeAbholzeit,
+} = require("./email");
+const { generateInvoicePdf } = require("./invoice");
 
 const PORT = process.env.PORT || 4000;
 
@@ -107,6 +116,14 @@ async function handlePostOrder(req, res) {
 
   const total = items.reduce((sum, it) => sum + it.price * it.qty, 0);
 
+  // Abholtermin + Rechnungsnummer EINMAL berechnen und in der Bestellung
+  // speichern, damit Kunden-Mail, Besitzer-Mail und die (später über den
+  // Link abrufbare) Rechnungs-PDF garantiert denselben Termin/dieselbe
+  // Nummer zeigen – auch wenn die Rechnung erst Tage später abgerufen wird.
+  const abholtermin = computeAbholzeit();
+  const invoiceNumber = await store.nextInvoiceNumber();
+  const invoiceDate = new Date().toLocaleDateString("de-AT");
+
   const order = {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
@@ -114,23 +131,110 @@ async function handlePostOrder(req, res) {
     customerEmail,
     items,
     total,
+    abholtermin,
+    invoiceNumber,
+    invoiceDate,
   };
   await store.appendOrder(order);
+
+  const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
+  const invoiceUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/invoice/${order.id}` : null;
 
   // E-Mails verschicken – ein Fehler hier soll die Bestellung selbst nicht
   // rückgängig machen (Bestand ist schon korrekt abgezogen und gespeichert).
   const [customerMailResult, ownerMailResult] = await Promise.all([
-    sendCustomerConfirmation({ customerName, customerEmail, items, total }).catch((err) => {
+    sendCustomerConfirmation({ customerName, customerEmail, items, total, abholtermin }).catch((err) => {
       console.error("[order] Fehler beim Senden der Kunden-Mail:", err);
       return { ok: false, error: String(err) };
     }),
-    sendOwnerNotification({ customerName, customerEmail, items, total }).catch((err) => {
+    sendOwnerNotification({ customerName, customerEmail, items, total, abholtermin, invoiceUrl }).catch((err) => {
       console.error("[order] Fehler beim Senden der Besitzer-Mail:", err);
       return { ok: false, error: String(err) };
     }),
   ]);
 
   sendJson(res, 200, { ok: true, order, emails: { customerMailResult, ownerMailResult } });
+}
+
+// Liefert die PDF-Rechnung zu einer gespeicherten Bestellung aus (per
+// Bestellungs-ID). Wird aus der internen Besitzer-Benachrichtigung heraus
+// verlinkt, damit Lukas sie zu Hause direkt öffnen/ausdrucken kann.
+async function handleGetInvoice(req, res, orderId) {
+  const order = await store.getOrderById(orderId);
+  if (!order) {
+    return sendJson(res, 404, { ok: false, error: "not_found" });
+  }
+
+  let pdfBuffer;
+  try {
+    pdfBuffer = await generateInvoicePdf(order);
+  } catch (err) {
+    console.error("[invoice] Fehler beim Erzeugen der PDF-Rechnung:", err);
+    return sendJson(res, 500, { ok: false, error: "invoice_generation_failed" });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "application/pdf",
+    "Content-Disposition": `inline; filename="Rechnung-${order.invoiceNumber || order.id}.pdf"`,
+    "Content-Length": pdfBuffer.length,
+  });
+  res.end(pdfBuffer);
+}
+
+// Erwarteter Body: { name, email, subject, message }
+async function handlePostContact(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    return sendJson(res, 400, { ok: false, error: "invalid_json" });
+  }
+
+  const { name, email, subject, message } = body || {};
+  if (!name || !email || !message) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request" });
+  }
+
+  const [ownerMailResult, customerMailResult] = await Promise.all([
+    sendContactNotification({ name, email, subject, message }).catch((err) => {
+      console.error("[contact] Fehler beim Senden der Kontakt-Mail:", err);
+      return { ok: false, error: String(err) };
+    }),
+    sendContactConfirmation({ name, email }).catch((err) => {
+      console.error("[contact] Fehler beim Senden der Bestätigungs-Mail:", err);
+      return { ok: false, error: String(err) };
+    }),
+  ]);
+
+  sendJson(res, 200, { ok: true, emails: { ownerMailResult, customerMailResult } });
+}
+
+// Erwarteter Body: { name, email, phone, occasion, date, location, message }
+async function handlePostBooking(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    return sendJson(res, 400, { ok: false, error: "invalid_json" });
+  }
+
+  const { name, email, phone, occasion, date, location, message } = body || {};
+  if (!name || !email) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request" });
+  }
+
+  const [ownerMailResult, customerMailResult] = await Promise.all([
+    sendBookingNotification({ name, email, phone, occasion, date, location, message }).catch((err) => {
+      console.error("[booking] Fehler beim Senden der Besitzer-Mail:", err);
+      return { ok: false, error: String(err) };
+    }),
+    sendBookingConfirmation({ name, email, occasion, date }).catch((err) => {
+      console.error("[booking] Fehler beim Senden der Kunden-Mail:", err);
+      return { ok: false, error: String(err) };
+    }),
+  ]);
+
+  sendJson(res, 200, { ok: true, emails: { ownerMailResult, customerMailResult } });
 }
 
 // ---------- Admin: manuelle Bestandskorrektur (z.B. bei Stornierung) ----------
@@ -185,8 +289,21 @@ const server = http.createServer(async (req, res) => {
       return await handlePostOrder(req, res);
     }
 
+    if (req.method === "POST" && url.pathname === "/api/contact") {
+      return await handlePostContact(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/booking") {
+      return await handlePostBooking(req, res);
+    }
+
     if (req.method === "GET" && url.pathname === "/api/admin/adjust-stock") {
       return await handleAdminAdjustStock(req, res, url);
+    }
+
+    const invoiceMatch = url.pathname.match(/^\/api\/invoice\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && invoiceMatch) {
+      return await handleGetInvoice(req, res, invoiceMatch[1]);
     }
 
     sendJson(res, 404, { ok: false, error: "not_found" });

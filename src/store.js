@@ -21,6 +21,7 @@ const path = require("path");
 const DATA_DIR = path.join(__dirname, "..", "data");
 const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
 const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
+const INVOICE_COUNTER_FILE = path.join(DATA_DIR, "invoiceCounter.json");
 
 // ---- Warteschlange, damit Lese-/Schreibvorgänge nie überlappen ----
 let queue = Promise.resolve();
@@ -105,10 +106,34 @@ async function getOrders() {
   return readJson(ORDERS_FILE, []);
 }
 
+async function getOrderById(id) {
+  const orders = await readJson(ORDERS_FILE, []);
+  return orders.find((o) => o.id === id) || null;
+}
+
+/**
+ * Vergibt die nächste fortlaufende Rechnungsnummer im Format "R-JAHR-0001".
+ * Die Zählung startet jedes Jahr wieder bei 1 (Zähler liegt pro Jahr in
+ * data/invoiceCounter.json). Läuft exklusiv, damit auch bei zwei fast
+ * gleichzeitigen Bestellungen nie zweimal dieselbe Nummer vergeben wird.
+ */
+async function nextInvoiceNumber(date = new Date()) {
+  return runExclusive(async () => {
+    const year = date.getFullYear();
+    const counters = await readJson(INVOICE_COUNTER_FILE, {});
+    const next = (counters[year] || 0) + 1;
+    counters[year] = next;
+    await writeJson(INVOICE_COUNTER_FILE, counters);
+    return `R-${year}-${String(next).padStart(4, "0")}`;
+  });
+}
+
 module.exports = {
   getProducts,
   decrementStock,
   incrementStock,
   appendOrder,
   getOrders,
+  getOrderById,
+  nextInvoiceNumber,
 };
