@@ -6,8 +6,7 @@
 const fs = require("fs");
 const path = require("path");
 
-// Gleiche Artikel-IDs und Start-Bestand wie in js/shop.js (Stand: Excel-Import
-// 2026-08-11, Warenkorb_feuerwerkshop-leicht). Preis/Name/Beschreibung/Bild
+// Gleiche Artikel-IDs und Start-Bestand wie in js/shop.js (Stand: 2026-08-17). Preis/Name/Beschreibung/Bild
 // bleiben bewusst im Frontend (shop.js) – der Server kennt nur das, was er
 // wirklich braucht: ID und Bestand.
 const SEED_PRODUCTS = [
@@ -16,6 +15,7 @@ const SEED_PRODUCTS = [
   { id: "gigant-2", name: "Gigant 2", stock: 36 },
   { id: "baron-brokat", name: "Baron Brokat", stock: 24 },
   { id: "gold-blue-batch-2024", name: "Gold-Blue (Batch 2024)", stock: 24 },
+  { id: "armor", name: "Armor", stock: 12 },
   { id: "plasma", name: "Plasma", stock: 8 },
   { id: "opal", name: "Opal", stock: 8 },
   { id: "v-wie-vokuhila", name: "V wie Vokuhila", stock: 16 },
@@ -36,15 +36,18 @@ const SEED_PRODUCTS = [
   // Verbundfeuerwerk
   { id: "wilk", name: "Wilk", stock: 3 },
   { id: "pyroshow-1000-c-cimelia", name: "Pyroshow 1000-C Cimelia", stock: 2 },
-  { id: "okazja", name: "Okazja", stock: 6 },
+  { id: "okazja", name: "Okazja", stock: 4 },
   { id: "felis-leo", name: "Felis Leo", stock: 2 },
   { id: "panthera", name: "Panthera", stock: 2 },
   { id: "nightshade", name: "Nightshade", stock: 4 },
   { id: "startowac", name: "Startowac", stock: 2 },
   { id: "sky-dance", name: "Sky Dance", stock: 2 },
   { id: "krawallig", name: "Krawallig", stock: 3 },
+  { id: "platzhirsch-130-gold", name: "Platzhirsch 130 Gold", stock: 1 },
   { id: "spirit-of-ecstasy", name: "Spirit of Ecstasy", stock: 4 },
+  { id: "4in1-showbox-nucleon", name: "4in1 Showbox Nucleon", stock: 3 },
   { id: "cyttorak", name: "Cyttorak", stock: 2 },
+  { id: "vengeance", name: "Vengeance", stock: 1 },
   { id: "mucho-power", name: "Mucho Power", stock: 2 },
   { id: "dubai", name: "Dubai", stock: 2 },
   { id: "tokyo", name: "Tokyo", stock: 1 },
