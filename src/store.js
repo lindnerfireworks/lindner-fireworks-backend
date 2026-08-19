@@ -62,7 +62,19 @@ async function getProducts() {
  * Zieht `qty` von Produkt `id` ab, aber nur wenn genug Bestand da ist.
  * Läuft exklusiv (keine zwei Bestellungen können sich hier überschneiden).
  */
+/**
+ * Prüft, dass eine Stückzahl eine echte positive Ganzzahl ist.
+ * Ohne diese Prüfung würde eine negative Menge den Bestand ERHÖHEN
+ * (`stock -= -10`), weil auch der Vergleich `stock < qty` dann nicht greift.
+ */
+function isValidQty(qty) {
+  return Number.isInteger(qty) && qty > 0 && qty <= 999;
+}
+
 async function decrementStock(id, qty) {
+  if (!isValidQty(qty)) {
+    return { ok: false, reason: "invalid_qty", id };
+  }
   return runExclusive(async () => {
     const products = await readJson(PRODUCTS_FILE, []);
     const product = products.find((p) => p.id === id);
@@ -83,6 +95,9 @@ async function decrementStock(id, qty) {
  * mit mehreren Artikeln nur teilweise durchgeht).
  */
 async function incrementStock(id, qty) {
+  if (!isValidQty(qty)) {
+    return { ok: false, reason: "invalid_qty", id };
+  }
   return runExclusive(async () => {
     const products = await readJson(PRODUCTS_FILE, []);
     const product = products.find((p) => p.id === id);

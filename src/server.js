@@ -26,15 +26,73 @@ const {
   computeAbholzeit,
 } = require("./email");
 const { generateInvoicePdf } = require("./invoice");
+const { getProduct } = require("./catalog");
 
 const PORT = process.env.PORT || 4000;
 
-function setCorsHeaders(res) {
-  // TODO vor Live-Betrieb: statt "*" die echte Website-Domain eintragen.
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// Nur diese Herkünfte dürfen das Backend aufrufen. Weitere (z.B. eine eigene
+// Domain) über die Umgebungsvariable ALLOWED_ORIGINS ergänzen, kommagetrennt.
+const DEFAULT_ORIGINS = [
+  "https://lindner-fireworks.netlify.app",
+  "http://localhost:3000",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500",
+];
+
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim().replace(/\/$/, ""))
+    .filter(Boolean)
+    .concat(DEFAULT_ORIGINS)
+);
+
+function setCorsHeaders(req, res) {
+  const origin = (req.headers.origin || "").replace(/\/$/, "");
+  if (ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
+
+// ---------------------------------------------------------------------------
+// Einfaches Rate Limiting im Arbeitsspeicher. Verhindert, dass jemand per
+// Skript den ganzen Lagerbestand leerbestellt oder das Kontaktformular als
+// Mail-Schleuder missbraucht. Reicht für einen Shop dieser Größe völlig; bei
+// einem Neustart des Servers werden die Zähler zurückgesetzt, was unkritisch ist.
+// ---------------------------------------------------------------------------
+const rateBuckets = new Map();
+
+function clientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
+  return req.socket.remoteAddress || "unbekannt";
+}
+
+/** Gibt true zurück, wenn die Anfrage erlaubt ist. */
+function rateLimitOk(req, bucket, maxRequests, windowMs) {
+  const key = `${bucket}:${clientIp(req)}`;
+  const now = Date.now();
+  const entry = rateBuckets.get(key);
+
+  if (!entry || now > entry.resetAt) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= maxRequests) return false;
+  entry.count += 1;
+  return true;
+}
+
+// Alte Einträge gelegentlich aufräumen, damit die Map nicht unbegrenzt wächst.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateBuckets) {
+    if (now > entry.resetAt) rateBuckets.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
 
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
@@ -73,15 +131,14 @@ async function handleGetProducts(req, res) {
 // {
 //   customerName: "Max Mustermann",
 //   customerEmail: "max@example.com",
-//   items: [{ id: "big-party-2", name: "Big Party 2", price: 75.8, qty: 2 }, ...]
+//   customerPhone: "+43 660 1234567",   // optional
+//   ageConfirmed: true,                 // Pflicht (Kategorie F2, ab 16)
+//   items: [{ id: "aidos", qty: 2 }, ...]
 // }
 //
-// Hinweis: Name/Preis pro Artikel kommen hier vom Frontend, nicht aus einer
-// serverseitigen Preisliste. Für einen Shop ohne Online-Bezahlung (nur
-// Abholung/Barzahlung, wie hier) ist das unkritisch. Käme hier später mal
-// echtes Online-Bezahlen dazu, müsste der Preis stattdessen serverseitig aus
-// data/products.json nachgeschlagen werden, damit niemand den Preis im
-// Browser manipulieren kann.
+// Preis und Artikelname werden bewusst NICHT vom Frontend übernommen, sondern
+// serverseitig aus src/catalog.js nachgeschlagen. Alles andere ließe sich über
+// die Entwicklertools des Browsers manipulieren.
 async function handlePostOrder(req, res) {
   let body;
   try {
@@ -90,10 +147,57 @@ async function handlePostOrder(req, res) {
     return sendJson(res, 400, { ok: false, error: "invalid_json" });
   }
 
-  const { customerName, customerEmail, items } = body || {};
+  const { customerName, customerEmail, customerPhone, items: rawItems, ageConfirmed } = body || {};
 
-  if (!customerName || !customerEmail || !Array.isArray(items) || items.length === 0) {
+  if (!customerName || !customerEmail || !Array.isArray(rawItems) || rawItems.length === 0) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
+  }
+
+  if (String(customerName).length > 100 || String(customerEmail).length > 200) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request" });
+  }
+
+  // Einfache Plausibilitätsprüfung der E-Mail-Adresse.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(customerEmail))) {
+    return sendJson(res, 400, { ok: false, error: "invalid_email" });
+  }
+
+  // Altersbestätigung (Kategorie F2 darf nicht an unter 16-Jährige überlassen
+  // werden, § 30 Abs. 1 PyroTG 2010 iVm § 15 Z 2).
+  if (ageConfirmed !== true) {
+    return sendJson(res, 400, { ok: false, error: "age_not_confirmed" });
+  }
+
+  if (rawItems.length > 50) {
+    return sendJson(res, 400, { ok: false, error: "too_many_items" });
+  }
+
+  // ---------------------------------------------------------------------
+  // Preise und Namen kommen AUSSCHLIESSLICH aus dem Katalog des Servers.
+  // Was der Browser mitschickt, wird bis auf id und qty verworfen – sonst
+  // könnte jeder über die Entwicklertools seinen eigenen Preis bestimmen.
+  // ---------------------------------------------------------------------
+  const items = [];
+  const seen = new Set();
+
+  for (const raw of rawItems) {
+    const id = raw && typeof raw.id === "string" ? raw.id : null;
+    const qty = raw ? Number(raw.qty) : NaN;
+
+    if (!id || !Number.isInteger(qty) || qty < 1 || qty > 99) {
+      return sendJson(res, 400, { ok: false, error: "invalid_item", productId: id });
+    }
+    if (seen.has(id)) {
+      return sendJson(res, 400, { ok: false, error: "duplicate_item", productId: id });
+    }
+    seen.add(id);
+
+    const product = getProduct(id);
+    if (!product) {
+      return sendJson(res, 400, { ok: false, error: "unknown_product", productId: id });
+    }
+
+    items.push({ id: product.id, name: product.name, price: product.price, qty });
   }
 
   const decremented = []; // für Rollback, falls ein späterer Artikel nicht verfügbar ist
@@ -129,6 +233,7 @@ async function handlePostOrder(req, res) {
     createdAt: new Date().toISOString(),
     customerName,
     customerEmail,
+    customerPhone: customerPhone ? String(customerPhone).slice(0, 40) : "",
     items,
     total,
     abholtermin,
@@ -292,7 +397,7 @@ async function handleAdminAdjustStock(req, res, url) {
 }
 
 const server = http.createServer(async (req, res) => {
-  setCorsHeaders(res);
+  setCorsHeaders(req, res);
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -311,14 +416,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/order") {
+      // Max. 5 Bestellungen pro IP und Stunde.
+      if (!rateLimitOk(req, "order", 5, 60 * 60 * 1000)) {
+        return sendJson(res, 429, { ok: false, error: "rate_limited" });
+      }
       return await handlePostOrder(req, res);
     }
 
     if (req.method === "POST" && url.pathname === "/api/contact") {
+      // Max. 3 Nachrichten pro IP und Stunde.
+      if (!rateLimitOk(req, "contact", 3, 60 * 60 * 1000)) {
+        return sendJson(res, 429, { ok: false, error: "rate_limited" });
+      }
       return await handlePostContact(req, res);
     }
 
     if (req.method === "POST" && url.pathname === "/api/booking") {
+      // Max. 3 Anfragen pro IP und Stunde.
+      if (!rateLimitOk(req, "booking", 3, 60 * 60 * 1000)) {
+        return sendJson(res, 429, { ok: false, error: "rate_limited" });
+      }
       return await handlePostBooking(req, res);
     }
 
