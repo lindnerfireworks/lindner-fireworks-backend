@@ -25,7 +25,7 @@ const {
   sendBookingConfirmation,
   computeAbholzeit,
 } = require("./email");
-const { generateInvoicePdf } = require("./invoice");
+const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
 
 const PORT = process.env.PORT || 4000;
@@ -220,13 +220,13 @@ async function handlePostOrder(req, res) {
 
   const total = items.reduce((sum, it) => sum + it.price * it.qty, 0);
 
-  // Abholtermin + Rechnungsnummer EINMAL berechnen und in der Bestellung
+  // Abholtermin + Reservierungsnummer EINMAL berechnen und in der Reservierung
   // speichern, damit Kunden-Mail, Besitzer-Mail und die (später über den
-  // Link abrufbare) Rechnungs-PDF garantiert denselben Termin/dieselbe
-  // Nummer zeigen – auch wenn die Rechnung erst Tage später abgerufen wird.
+  // Link abrufbare) Abholschein-PDF garantiert denselben Termin/dieselbe
+  // Nummer zeigen – auch wenn der Abholschein erst Tage später abgerufen wird.
   const abholtermin = computeAbholzeit();
-  const invoiceNumber = await store.nextInvoiceNumber();
-  const invoiceDate = new Date().toLocaleDateString("de-AT");
+  const reservationNumber = await store.nextReservationNumber();
+  const reservationDate = new Date().toLocaleDateString("de-AT");
 
   const order = {
     id: crypto.randomUUID(),
@@ -237,21 +237,21 @@ async function handlePostOrder(req, res) {
     items,
     total,
     abholtermin,
-    invoiceNumber,
-    invoiceDate,
+    reservationNumber,
+    reservationDate,
   };
   await store.appendOrder(order);
 
   const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
-  const invoiceUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/invoice/${order.id}` : null;
+  const abholscheinUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/abholschein/${order.id}` : null;
 
-  // Rechnung als PDF erzeugen, damit sie der Kundenmail angehängt werden kann.
+  // Abholschein als PDF erzeugen, damit er der Kundenmail angehängt werden kann.
   // Schlägt das fehl, wird die Mail trotzdem verschickt – nur eben ohne Anhang.
-  let invoicePdf = null;
+  let abholscheinPdf = null;
   try {
-    invoicePdf = await generateInvoicePdf(order);
+    abholscheinPdf = await generateReservationPdf(order);
   } catch (err) {
-    console.error("[order] Rechnung konnte nicht erzeugt werden, Mail geht ohne Anhang raus:", err);
+    console.error("[order] Abholschein konnte nicht erzeugt werden, Mail geht ohne Anhang raus:", err);
   }
 
   // E-Mails verschicken – ein Fehler hier soll die Bestellung selbst nicht
@@ -263,8 +263,8 @@ async function handlePostOrder(req, res) {
       items,
       total,
       abholtermin,
-      invoiceNumber,
-      invoicePdf,
+      reservationNumber,
+      abholscheinPdf,
     }).catch((err) => {
       console.error("[order] Fehler beim Senden der Kunden-Mail:", err);
       return { ok: false, error: String(err) };
@@ -275,8 +275,8 @@ async function handlePostOrder(req, res) {
       items,
       total,
       abholtermin,
-      invoiceUrl,
-      invoiceNumber,
+      abholscheinUrl,
+      reservationNumber,
     }).catch((err) => {
       console.error("[order] Fehler beim Senden der Besitzer-Mail:", err);
       return { ok: false, error: String(err) };
@@ -286,10 +286,10 @@ async function handlePostOrder(req, res) {
   sendJson(res, 200, { ok: true, order, emails: { customerMailResult, ownerMailResult } });
 }
 
-// Liefert die PDF-Rechnung zu einer gespeicherten Bestellung aus (per
+// Liefert den PDF-Abholschein zu einer gespeicherten Reservierung aus (per
 // Bestellungs-ID). Wird aus der internen Besitzer-Benachrichtigung heraus
 // verlinkt, damit Lukas sie zu Hause direkt öffnen/ausdrucken kann.
-async function handleGetInvoice(req, res, orderId) {
+async function handleGetAbholschein(req, res, orderId) {
   const order = await store.getOrderById(orderId);
   if (!order) {
     return sendJson(res, 404, { ok: false, error: "not_found" });
@@ -297,15 +297,15 @@ async function handleGetInvoice(req, res, orderId) {
 
   let pdfBuffer;
   try {
-    pdfBuffer = await generateInvoicePdf(order);
+    pdfBuffer = await generateReservationPdf(order);
   } catch (err) {
-    console.error("[invoice] Fehler beim Erzeugen der PDF-Rechnung:", err);
-    return sendJson(res, 500, { ok: false, error: "invoice_generation_failed" });
+    console.error("[abholschein] Fehler beim Erzeugen des PDF-Abholscheins:", err);
+    return sendJson(res, 500, { ok: false, error: "pdf_generation_failed" });
   }
 
   res.writeHead(200, {
     "Content-Type": "application/pdf",
-    "Content-Disposition": `inline; filename="Rechnung-${order.invoiceNumber || order.id}.pdf"`,
+    "Content-Disposition": `inline; filename="Abholschein-${order.reservationNumber || order.id}.pdf"`,
     "Content-Length": pdfBuffer.length,
   });
   res.end(pdfBuffer);
@@ -443,9 +443,9 @@ const server = http.createServer(async (req, res) => {
       return await handleAdminAdjustStock(req, res, url);
     }
 
-    const invoiceMatch = url.pathname.match(/^\/api\/invoice\/([a-f0-9-]{36})$/i);
-    if (req.method === "GET" && invoiceMatch) {
-      return await handleGetInvoice(req, res, invoiceMatch[1]);
+    const abholscheinMatch = url.pathname.match(/^\/api\/abholschein\/([a-f0-9-]{36})$/i);
+    if (req.method === "GET" && abholscheinMatch) {
+      return await handleGetAbholschein(req, res, abholscheinMatch[1]);
     }
 
     sendJson(res, 404, { ok: false, error: "not_found" });

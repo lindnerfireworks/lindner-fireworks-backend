@@ -127,19 +127,23 @@ async function getOrderById(id) {
 }
 
 /**
- * Vergibt die nächste fortlaufende Rechnungsnummer im Format "R-JAHR-0001".
+ * Vergibt die nächste fortlaufende Reservierungsnummer im Format "RES-JAHR-0001".
+ *
+ * Bewusst KEINE Rechnungsnummer: über die Website wird nur reserviert, der
+ * Kaufvertrag kommt erst bei der Abholung zustande. Die eigentliche Rechnung
+ * wird erst dort ausgestellt.
  * Die Zählung startet jedes Jahr wieder bei 1 (Zähler liegt pro Jahr in
  * data/invoiceCounter.json). Läuft exklusiv, damit auch bei zwei fast
  * gleichzeitigen Bestellungen nie zweimal dieselbe Nummer vergeben wird.
  */
-async function nextInvoiceNumber(date = new Date()) {
+async function nextReservationNumber(date = new Date()) {
   return runExclusive(async () => {
     const year = date.getFullYear();
     const counters = await readJson(INVOICE_COUNTER_FILE, {});
     const next = (counters[year] || 0) + 1;
     counters[year] = next;
     await writeJson(INVOICE_COUNTER_FILE, counters);
-    return `R-${year}-${String(next).padStart(4, "0")}`;
+    return `RES-${year}-${String(next).padStart(4, "0")}`;
   });
 }
 
@@ -150,5 +154,5 @@ module.exports = {
   appendOrder,
   getOrders,
   getOrderById,
-  nextInvoiceNumber,
+  nextReservationNumber,
 };

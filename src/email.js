@@ -10,7 +10,7 @@
 //   RESEND_FROM      – Absender, z.B. "Lindner Fireworks <bestellung@domain.at>"
 //   OWNER_EMAIL      – wohin interne Benachrichtigungen gehen
 //   SITE_BASE_URL    – öffentliche Adresse der Website (für das Logo)
-//   PUBLIC_BASE_URL  – öffentliche Adresse DIESES Servers (für den Rechnungslink)
+//   PUBLIC_BASE_URL  – öffentliche Adresse DIESES Servers (für den Abholschein-Link)
 //   ABHOL_ADRESSE, KONTAKT_TELEFON, KONTAKT_EMAIL – Angaben in den Mails
 
 const RESEND_API_URL = "https://api.resend.com/emails";
@@ -238,15 +238,15 @@ async function sendCustomerConfirmation({
   items,
   total,
   abholtermin,
-  invoiceNumber,
-  invoicePdf,
+  reservationNumber,
+  abholscheinPdf,
 }) {
   const termin = abholtermin || computeAbholzeit();
-  const subject = "Deine Bestellung bei Lindner Fireworks – Bestätigung";
+  const subject = "Deine Reservierung bei Lindner Fireworks – Bestätigung";
 
-  const rechnungHinweis = invoicePdf
+  const rechnungHinweis = abholscheinPdf
     ? box(
-        `📎 <strong>Rechnung im Anhang</strong> (PDF)${invoiceNumber ? ` — Rechnungsnr. ${escapeHtml(invoiceNumber)}` : ""}`,
+        `📎 <strong>Abholschein im Anhang</strong> (PDF)${reservationNumber ? ` — Reservierungsnr. ${escapeHtml(reservationNumber)}` : ""}`,
         "bestellung",
         true
       )
@@ -254,12 +254,12 @@ async function sendCustomerConfirmation({
 
   const html = layout({
     theme: "bestellung",
-    title: "BESTELLUNG BESTÄTIGT ✔",
+    title: "RESERVIERUNG BESTÄTIGT ✔",
     kicker: "Silvester-Shop",
     content:
       block(
         `<p style="margin:0 0 16px;">Hallo ${escapeHtml(customerName)},</p>
-         <p style="margin:0 0 4px;">vielen Dank für deine Bestellung bei <strong>Lindner Fireworks</strong>! Hier deine Bestätigung:</p>`
+         <p style="margin:0 0 4px;">vielen Dank für deine Reservierung bei <strong>Lindner Fireworks</strong>! Hier deine Bestätigung:</p>`
       ) +
       itemsTable(items, total, "bestellung") +
       rechnungHinweis +
@@ -275,13 +275,13 @@ async function sendCustomerConfirmation({
 
   const text = `Hallo ${customerName},
 
-vielen Dank für deine Bestellung bei Lindner Fireworks!
+vielen Dank für deine Reservierung bei Lindner Fireworks!
 
 Deine Artikel:
 ${itemsListText(items)}
 
 Gesamt: ${formatPrice(total)}
-${invoiceNumber ? `Rechnungsnummer: ${invoiceNumber}\n` : ""}
+${reservationNumber ? `Reservierungsnummer: ${reservationNumber}\n` : ""}
 Abholung:
 Adresse: ${ADRESSE}
 Abholtermin: ${termin}
@@ -295,11 +295,11 @@ ${EMAIL_KONTAKT}
 Liebe Grüße
 Lindner Fireworks`;
 
-  const attachments = invoicePdf
+  const attachments = abholscheinPdf
     ? [
         {
-          filename: `Rechnung-${invoiceNumber || "Lindner-Fireworks"}.pdf`,
-          content: Buffer.isBuffer(invoicePdf) ? invoicePdf.toString("base64") : invoicePdf,
+          filename: `Abholschein-${reservationNumber || "Lindner-Fireworks"}.pdf`,
+          content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
         },
       ]
     : undefined;
@@ -317,17 +317,17 @@ async function sendOwnerNotification({
   items,
   total,
   abholtermin,
-  invoiceUrl,
-  invoiceNumber,
+  abholscheinUrl,
+  reservationNumber,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
   const termin = abholtermin || computeAbholzeit();
   const zeitpunkt = new Date().toLocaleString("de-AT");
-  const subject = `Neue Bestellung – ${customerName}`;
+  const subject = `Neue Reservierung – ${customerName}`;
 
-  const rechnungBlock = invoiceUrl
+  const rechnungBlock = abholscheinUrl
     ? box(
-        `📎 <a href="${escapeHtml(invoiceUrl)}" style="color:#e10586; font-weight:700; text-decoration:none;">Rechnung ansehen / ausdrucken (PDF)</a>${invoiceNumber ? ` — Rechnungsnr. ${escapeHtml(invoiceNumber)}` : ""}`,
+        `📎 <a href="${escapeHtml(abholscheinUrl)}" style="color:#e10586; font-weight:700; text-decoration:none;">Abholschein ansehen / ausdrucken (PDF)</a>${reservationNumber ? ` — Reservierungsnr. ${escapeHtml(reservationNumber)}` : ""}`,
         "bestellung",
         true
       )
@@ -335,7 +335,7 @@ async function sendOwnerNotification({
 
   const html = layout({
     theme: "intern",
-    title: "🔔 NEUE BESTELLUNG",
+    title: "🔔 NEUE RESERVIERUNG",
     kicker: "Interne Benachrichtigung",
     content:
       box(
@@ -350,11 +350,11 @@ async function sendOwnerNotification({
         true
       ) +
       rechnungBlock +
-      zeitstempel(`Eingegangen am ${zeitpunkt} · Bestand wurde automatisch abgebucht.`),
+      zeitstempel(`Eingegangen am ${zeitpunkt} · Bestand wurde automatisch reserviert.`),
     footer: `<strong style="color:#24273a;">LINDNER FIREWORKS</strong> — Backend-Benachrichtigung`,
   });
 
-  const text = `Neue Bestellung im Shop eingegangen:
+  const text = `Neue Reservierung im Shop eingegangen:
 
 Kunde: ${customerName} (${customerEmail})
 
@@ -364,7 +364,7 @@ ${itemsListText(items)}
 Gesamt: ${formatPrice(total)}
 
 Abholtermin (Kunde wurde bereits informiert): ${termin}
-${invoiceUrl ? `\nRechnung (PDF): ${invoiceUrl}\n` : ""}
+${abholscheinUrl ? `\nAbholschein (PDF): ${abholscheinUrl}\n` : ""}
 Zeitpunkt: ${zeitpunkt}`;
 
   return sendEmail({ to: ownerEmail, subject, text, html });
