@@ -319,15 +319,18 @@ async function sendOwnerNotification({
   abholtermin,
   abholscheinUrl,
   reservationNumber,
+  abholscheinPdf,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
   const termin = abholtermin || computeAbholzeit();
   const zeitpunkt = new Date().toLocaleString("de-AT");
   const subject = `Neue Reservierung – ${customerName}`;
 
-  const rechnungBlock = abholscheinUrl
+  const rechnungBlock = (abholscheinPdf || abholscheinUrl)
     ? box(
-        `📎 <a href="${escapeHtml(abholscheinUrl)}" style="color:#e10586; font-weight:700; text-decoration:none;">Abholschein ansehen / ausdrucken (PDF)</a>${reservationNumber ? ` — Reservierungsnr. ${escapeHtml(reservationNumber)}` : ""}`,
+        `📎 <strong>Abholschein im Anhang</strong> (PDF) zum Ausdrucken und Mitnehmen` +
+          `${reservationNumber ? ` — Reservierungsnr. ${escapeHtml(reservationNumber)}` : ""}` +
+          `${abholscheinUrl ? `<br><span style="font-size:13px;">Oder <a href="${escapeHtml(abholscheinUrl)}" style="color:#e10586; font-weight:700; text-decoration:none;">online öffnen</a></span>` : ""}`,
         "bestellung",
         true
       )
@@ -364,10 +367,19 @@ ${itemsListText(items)}
 Gesamt: ${formatPrice(total)}
 
 Abholtermin (Kunde wurde bereits informiert): ${termin}
-${abholscheinUrl ? `\nAbholschein (PDF): ${abholscheinUrl}\n` : ""}
+${abholscheinPdf ? "\nAbholschein: siehe Anhang (PDF)\n" : ""}${abholscheinUrl ? `Online: ${abholscheinUrl}\n` : ""}
 Zeitpunkt: ${zeitpunkt}`;
 
-  return sendEmail({ to: ownerEmail, subject, text, html });
+  const attachments = abholscheinPdf
+    ? [
+        {
+          filename: `Abholschein-${reservationNumber || "Lindner-Fireworks"}.pdf`,
+          content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
+        },
+      ]
+    : undefined;
+
+  return sendEmail({ to: ownerEmail, subject, text, html, attachments });
 }
 
 // ---------------------------------------------------------------------------

@@ -277,6 +277,7 @@ async function handlePostOrder(req, res) {
       abholtermin,
       abholscheinUrl,
       reservationNumber,
+      abholscheinPdf,
     }).catch((err) => {
       console.error("[order] Fehler beim Senden der Besitzer-Mail:", err);
       return { ok: false, error: String(err) };
