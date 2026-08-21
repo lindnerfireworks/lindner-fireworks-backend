@@ -30,6 +30,50 @@ const { getProduct } = require("./catalog");
 
 const PORT = process.env.PORT || 4000;
 
+// ---------------------------------------------------------------------------
+// Verkaufsfenster
+//
+// Vor diesem Datum nimmt der Shop KEINE Reservierungen an. Die Artikel bleiben
+// sichtbar und der Warenkorb lässt sich befüllen – nur das Absenden wird
+// blockiert, im Browser (Button gesperrt) UND hier serverseitig, damit es sich
+// nicht über die Entwicklerkonsole umgehen lässt.
+//
+// Umstellen ohne Code-Änderung über die Umgebungsvariable ORDERS_OPEN_FROM
+// (Format JJJJ-MM-TT, Ortszeit Österreich). Beispiele:
+//   ORDERS_OPEN_FROM=2026-12-01   -> ab 1. Dezember 2026, 00:00 Uhr
+//   ORDERS_OPEN_FROM=              -> sofort offen (leerer Wert = keine Sperre)
+// Optional lässt sich mit ORDERS_OPEN_UNTIL auch ein Ende setzen, z.B. nach
+// Silvester: ORDERS_OPEN_UNTIL=2027-01-01
+// ---------------------------------------------------------------------------
+const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "2026-12-01").trim();
+const ORDERS_OPEN_UNTIL = (process.env.ORDERS_OPEN_UNTIL || "").trim();
+
+/**
+ * Wandelt "2026-12-01" in einen Zeitpunkt um, der Mitternacht österreichischer
+ * Zeit entspricht. Im Dezember gilt MEZ (UTC+1), deshalb wird eine Stunde
+ * abgezogen. Bei ungültiger Eingabe wird null geliefert (= keine Sperre), damit
+ * ein Tippfehler in der Variable nie den ganzen Shop lahmlegt.
+ */
+function parseViennaDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const ms = Date.parse(`${value}T00:00:00+01:00`);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Ist der Shop gerade für Reservierungen offen? */
+function shopStatus(now = Date.now()) {
+  const from = parseViennaDate(ORDERS_OPEN_FROM);
+  const until = parseViennaDate(ORDERS_OPEN_UNTIL);
+
+  if (from !== null && now < from) {
+    return { open: false, reason: "not_yet", opensAt: ORDERS_OPEN_FROM };
+  }
+  if (until !== null && now >= until) {
+    return { open: false, reason: "season_over", closedSince: ORDERS_OPEN_UNTIL };
+  }
+  return { open: true, opensAt: from !== null ? ORDERS_OPEN_FROM : null };
+}
+
 // Nur diese Herkünfte dürfen das Backend aufrufen. Weitere (z.B. eine eigene
 // Domain) über die Umgebungsvariable ALLOWED_ORIGINS ergänzen, kommagetrennt.
 const DEFAULT_ORIGINS = [
@@ -416,7 +460,19 @@ const server = http.createServer(async (req, res) => {
       return await handleGetProducts(req, res);
     }
 
+    // Die Website fragt hier ab, ob der Shop schon Reservierungen annimmt,
+    // und blendet danach den Hinweis ein bzw. sperrt den Absende-Button.
+    if (req.method === "GET" && url.pathname === "/api/shop-status") {
+      return sendJson(res, 200, { ok: true, ...shopStatus() });
+    }
+
     if (req.method === "POST" && url.pathname === "/api/order") {
+      // Verkaufsfenster prüfen, BEVOR irgendetwas abgebucht oder gemailt wird.
+      const status = shopStatus();
+      if (!status.open) {
+        return sendJson(res, 403, { ok: false, error: "shop_closed", ...status });
+      }
+
       // Max. 5 Bestellungen pro IP und Stunde.
       if (!rateLimitOk(req, "order", 5, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
