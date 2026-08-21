@@ -24,6 +24,10 @@ const {
   sendBookingNotification,
   sendBookingConfirmation,
   computeAbholzeit,
+  sendDailyDigest,
+  slotForDay,
+  isoDay,
+  formatGermanDate,
 } = require("./email");
 const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
@@ -417,6 +421,270 @@ async function handlePostBooking(req, res) {
 // aufrufen kann, ohne dass du erst wieder Dateien hochladen musst) und nur
 // mit dem geheimen ADMIN_KEY (als Umgebungsvariable in Railway gesetzt, nicht
 // im Code). Ohne gesetzten ADMIN_KEY ist dieser Endpunkt komplett deaktiviert.
+// ---------------------------------------------------------------------------
+// Reservierungsübersicht fürs Handy
+//
+// Aufruf mit dem bestehenden ADMIN_KEY, z.B. als Lesezeichen am Handy:
+//   /api/admin/orders?key=DEINSCHLUESSEL
+//
+// Zeigt alle Reservierungen nach Abholtag gruppiert, mit Name, Telefon,
+// Artikeln und Summe. Bewusst als fertige HTML-Seite statt JSON, damit sie
+// unterwegs ohne Hilfsmittel lesbar ist.
+//
+// Optional: &tag=2026-12-27 zeigt nur diesen einen Abholtag.
+// ---------------------------------------------------------------------------
+
+function esc(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function euro(n) {
+  return Number(n || 0).toFixed(2).replace(".", ",") + " €";
+}
+
+/**
+ * Sortierschlüssel aus dem Termin-Text ("Freitag, 04.12.2026, 13:00–16:00 Uhr")
+ * -> "2026-12-04". Ohne erkennbares Datum kommt der Eintrag ans Ende.
+ */
+function terminSortKey(abholtermin) {
+  const m = String(abholtermin || "").match(/(\d{2})\.(\d{2})\.(\d{4})/);
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : "9999-99-99";
+}
+
+function groupOrdersByPickup(orders) {
+  const groups = new Map();
+  for (const o of orders) {
+    const key = terminSortKey(o.abholtermin);
+    if (!groups.has(key)) {
+      groups.set(key, { key, label: o.abholtermin || "Termin noch offen", orders: [] });
+    }
+    groups.get(key).orders.push(o);
+  }
+  return [...groups.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function renderOrdersPage(groups, { total, umsatz, filterTag }) {
+  const heute = new Date().toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" });
+
+  const gruppenHtml = groups
+    .map((g) => {
+      const zeilen = g.orders
+        .map((o) => {
+          const artikel = (o.items || [])
+            .map((it) => `${esc(it.name)} <b>×${esc(it.qty)}</b>`)
+            .join("<br>");
+          const tel = o.customerPhone
+            ? `<a href="tel:${esc(o.customerPhone.replace(/\s/g, ""))}">${esc(o.customerPhone)}</a>`
+            : '<span class="muted">keine Nummer</span>';
+          return `<div class="order">
+            <div class="order-head">
+              <span class="resnr">${esc(o.reservationNumber || "—")}</span>
+              <span class="sum">${euro(o.total)}</span>
+            </div>
+            <div class="name">${esc(o.customerName)}</div>
+            <div class="contact">${tel} · <a href="mailto:${esc(o.customerEmail)}">${esc(o.customerEmail)}</a></div>
+            <div class="items">${artikel || '<span class="muted">keine Artikel</span>'}</div>
+          </div>`;
+        })
+        .join("");
+
+      const gsum = g.orders.reduce((s, o) => s + Number(o.total || 0), 0);
+      return `<section class="day">
+        <h2>${esc(g.label)}</h2>
+        <p class="daymeta">${g.orders.length} ${g.orders.length === 1 ? "Reservierung" : "Reservierungen"} · ${euro(gsum)}</p>
+        ${zeilen}
+      </section>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Reservierungen — Lindner Fireworks</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:#28418c; color:#eef1fb;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:16px; }
+  h1 { font-size:21px; margin:0 0 2px; }
+  .meta { color:#cdd3f2; font-size:14px; margin-bottom:20px; }
+  .day { margin-bottom:26px; }
+  .day h2 { font-size:17px; margin:0 0 2px; color:#72f2bf; }
+  .daymeta { margin:0 0 10px; font-size:13px; color:#cdd3f2; }
+  .order { background:#3655a6; border:1px solid rgba(255,255,255,0.16);
+           border-radius:12px; padding:13px 15px; margin-bottom:9px; }
+  .order-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .resnr { font-size:12px; letter-spacing:1px; color:#ffd23d; font-weight:700; }
+  .sum { font-weight:700; color:#ff6fc4; }
+  .name { font-size:18px; font-weight:600; margin:3px 0 2px; }
+  .contact { font-size:14px; margin-bottom:8px; }
+  .items { font-size:14px; line-height:1.6; color:#cdd3f2;
+           border-top:1px solid rgba(255,255,255,0.13); padding-top:8px; }
+  .muted { color:#9aa0b4; }
+  a { color:#6adfff; }
+  .empty { background:#3655a6; border-radius:12px; padding:22px; text-align:center; color:#cdd3f2; }
+</style>
+</head>
+<body>
+  <h1>Reservierungen</h1>
+  <p class="meta">
+    Stand ${esc(heute)} · ${total} ${total === 1 ? "Reservierung" : "Reservierungen"} · ${euro(umsatz)} gesamt
+    ${filterTag ? `<br>Gefiltert auf ${esc(filterTag)}` : ""}
+  </p>
+  ${gruppenHtml || '<div class="empty">Noch keine Reservierungen.</div>'}
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// Tagesübersicht am Vorabend
+//
+// Prüft stündlich, ob es in Österreich gerade nach DIGEST_HOUR Uhr ist und ob
+// morgen ein Abholtag mit mindestens einer Reservierung ansteht. Wenn ja, geht
+// eine Übersichtsmail an OWNER_EMAIL.
+//
+// Bewusst kein Cron-Dienst: Der Server läuft ohnehin durch, und ein stündlicher
+// Timer ist eine Abhängigkeit weniger. Damit ein Neustart nicht zu einer
+// zweiten Mail führt, wird der zuletzt verschickte Tag auf dem Volume vermerkt.
+//
+//   DIGEST_HOUR=18       Uhrzeit (Ortszeit Österreich), Standard 18
+//   DIGEST_ENABLED=false schaltet die Funktion ab
+// ---------------------------------------------------------------------------
+const fsp = require("fs/promises");
+const path = require("path");
+
+const DIGEST_HOUR = Number(process.env.DIGEST_HOUR || 18);
+const DIGEST_ENABLED = (process.env.DIGEST_ENABLED || "true") !== "false";
+const DIGEST_STATE_FILE = path.join(__dirname, "..", "data", "digest-state.json");
+
+/** Stunde und Datum in österreichischer Zeit. */
+function viennaNowParts(now = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Vienna",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    hour12: false,
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
+  return {
+    day: `${parts.year}-${parts.month}-${parts.day}`,
+    hour: Number(parts.hour === "24" ? "0" : parts.hour),
+  };
+}
+
+async function readDigestState() {
+  try {
+    return JSON.parse(await fsp.readFile(DIGEST_STATE_FILE, "utf8"));
+  } catch (err) {
+    return { lastSentFor: null };
+  }
+}
+
+async function writeDigestState(state) {
+  try {
+    await fsp.mkdir(path.dirname(DIGEST_STATE_FILE), { recursive: true });
+    await fsp.writeFile(DIGEST_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch (err) {
+    console.error("[digest] Konnte Status nicht speichern:", err.message);
+  }
+}
+
+/**
+ * Ein Durchlauf. Gibt zurück, was passiert ist – erleichtert das Testen.
+ * force=true ignoriert Uhrzeit und Doppelsende-Schutz.
+ */
+async function runDailyDigest({ now = new Date(), force = false } = {}) {
+  if (!DIGEST_ENABLED && !force) return { skipped: "disabled" };
+
+  const { day, hour } = viennaNowParts(now);
+  if (!force && hour < DIGEST_HOUR) return { skipped: "zu_frueh" };
+
+  // Der Abholtag von morgen
+  const morgen = new Date(`${day}T12:00:00Z`);
+  morgen.setUTCDate(morgen.getUTCDate() + 1);
+  const morgenIso = isoDay(morgen);
+
+  if (!slotForDay(morgen)) return { skipped: "morgen_kein_abholtag", morgenIso };
+
+  const state = await readDigestState();
+  if (!force && state.lastSentFor === morgenIso) return { skipped: "schon_verschickt", morgenIso };
+
+  const alle = await store.getOrders();
+  const orders = alle.filter((o) => terminSortKey(o.abholtermin) === morgenIso);
+  if (orders.length === 0) {
+    await writeDigestState({ lastSentFor: morgenIso });
+    return { skipped: "keine_abholungen", morgenIso };
+  }
+
+  const adminKey = process.env.ADMIN_KEY;
+  const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+  const adminUrl =
+    base && adminKey ? `${base}/api/admin/orders?key=${encodeURIComponent(adminKey)}&tag=${morgenIso}` : null;
+
+  const result = await sendDailyDigest({
+    datumLabel: formatGermanDate(morgen),
+    orders,
+    adminUrl,
+  });
+
+  await writeDigestState({ lastSentFor: morgenIso });
+  console.log(`[digest] Tagesübersicht für ${morgenIso} verschickt (${orders.length} Abholungen).`);
+  return { sent: true, morgenIso, count: orders.length, result };
+}
+
+function scheduleDailyDigest() {
+  if (!DIGEST_ENABLED) {
+    console.log("[digest] Tagesübersicht ist per DIGEST_ENABLED=false abgeschaltet.");
+    return;
+  }
+  const tick = () => {
+    runDailyDigest().catch((err) => console.error("[digest] Fehler:", err));
+  };
+  tick(); // einmal direkt nach dem Start
+  setInterval(tick, 60 * 60 * 1000).unref();
+  console.log(`[digest] Tagesübersicht aktiv, Versand ab ${DIGEST_HOUR}:00 Uhr am Vorabend.`);
+}
+
+async function handleAdminOrders(req, res, url) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) {
+    return sendJson(res, 503, { ok: false, error: "admin_disabled" });
+  }
+  if (url.searchParams.get("key") !== adminKey) {
+    return sendJson(res, 401, { ok: false, error: "unauthorized" });
+  }
+
+  let orders = await store.getOrders();
+  const filterTag = url.searchParams.get("tag");
+  if (filterTag) {
+    orders = orders.filter((o) => terminSortKey(o.abholtermin) === filterTag);
+  }
+
+  // JSON statt HTML, falls jemand die Daten weiterverarbeiten will
+  if (url.searchParams.get("format") === "json") {
+    return sendJson(res, 200, { ok: true, count: orders.length, orders });
+  }
+
+  const groups = groupOrdersByPickup(orders);
+  const umsatz = orders.reduce((s, o) => s + Number(o.total || 0), 0);
+  const html = renderOrdersPage(groups, { total: orders.length, umsatz, filterTag });
+
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Robots-Tag": "noindex, nofollow",
+  });
+  res.end(html);
+}
+
 async function handleAdminAdjustStock(req, res, url) {
   const adminKey = process.env.ADMIN_KEY;
   if (!adminKey) {
@@ -496,6 +764,10 @@ const server = http.createServer(async (req, res) => {
       return await handlePostBooking(req, res);
     }
 
+    if (req.method === "GET" && url.pathname === "/api/admin/orders") {
+      return await handleAdminOrders(req, res, url);
+    }
+
     if (req.method === "GET" && url.pathname === "/api/admin/adjust-stock") {
       return await handleAdminAdjustStock(req, res, url);
     }
@@ -514,4 +786,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Lindner Fireworks Backend läuft auf Port ${PORT}`);
+  scheduleDailyDigest();
 });
