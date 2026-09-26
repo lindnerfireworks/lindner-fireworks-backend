@@ -1,67 +1,35 @@
 # Lindner Fireworks – Backend
 
-Kleiner Bestell-Server: echter Lagerbestand (zählt bei jeder Bestellung sofort
-runter, keine Überbestellung möglich), plus automatischer E-Mail-Versand
-(Bestätigung an Kunde + Benachrichtigung an Lukas).
+Stand 26.09.2026. Dieser Ordner ist der lokale Quellstand. Was auf Railway läuft, muss nach jedem Upload gesondert geprüft werden.
 
-## Was hier drin ist
+## Ablauf und Daten
 
-- `src/server.js` – der eigentliche Server (Express). Zwei Endpunkte:
-  `GET /api/products` (aktueller Bestand) und `POST /api/order` (Bestellung
-  aufgeben).
-- `src/store.js` – speichert Bestand & Bestellungen in `data/*.json`. Alle
-  Zugriffe laufen nacheinander durch eine Warteschlange, damit zwei
-  gleichzeitige Bestellungen sich nie in die Quere kommen.
-- `src/email.js` – verschickt die zwei E-Mails über Resend.
-- `src/seedProducts.js` – erzeugt einmalig `data/products.json` mit den
-  Start-Bestandszahlen aus `js/shop.js`.
+- `src/server.js`: Node-HTTP-Server ohne Express. Die Website liest über `GET /api/products` den verbindlichen Bestand und über `GET /api/shop-status` das Verkaufsfenster. Eine Reservierung geht an `POST /api/order`.
+- `src/catalog.js`: verbindliche Produktnamen und Preise. Browserpreise werden beim Reservieren ignoriert.
+- `src/store.js`: Produkte, Reservierungen und Zähler in `data/*.json` auf einem persistenten Railway-Volume. Eine Warteschlange serialisiert Änderungen in **einem** Serverprozess. Nicht mehrere Instanzen auf dasselbe Volume setzen.
+- `src/email.js`: Kunden- und Betreiberbestätigung über Resend, jeweils als HTML und Klartext. `src/invoice.js` erstellt einen **Abholschein**, keine Rechnung.
+- Der genaue Abholort kommt ausschließlich aus `ABHOL_ADRESSE` in Railway; der private HTTPS-Kartenlink aus `ABHOL_ANFAHRT_URL`. Beides wird nur in individuellen Kundenunterlagen und internen Abläufen verwendet. Die öffentliche Firmenanschrift im Impressum ist nicht automatisch der Abholort. Solange keine bestätigte Postadresse vorliegt, darf `ABHOL_ADRESSE` nur eine zutreffende Ortsbeschreibung enthalten; keine Adresse erfinden.
+- `src/seedProducts.js` dient nur dem **Erstbestand**. Auf einem bestehenden Railway-Volume nie erneut seeden: Das würde Bestandsänderungen überschreiben.
 
-## Lokal testen
+## Lokale Prüfung
 
-```bash
-cd backend
-npm install
-npm run seed        # legt data/products.json einmalig an
-npm start            # startet den Server auf http://localhost:4000
-```
+`tests/README.md` beschreibt den isolierten Test unter einem Verzeichnis **außerhalb** dieses Vaults. Der Test fängt Resend-Aufrufe ab, verwendet Testdaten und verändert keine echten Bestände oder Reservierungen.
 
-Dann in einem zweiten Terminal testen:
+Ohne konfigurierten Abholort, privaten Anfahrtslink, verifizierten Absender, Resend-Key und Betreiberadresse weist der aktuelle Code neue Reservierungen mit `service_not_ready` ab. Die Werte in `.env.example` sind Platzhalter, keine Zugangsdaten.
 
-```bash
-curl http://localhost:4000/api/products
+## Reservierungsbestätigung und Abholregel
 
-curl -X POST http://localhost:4000/api/order \
-  -H "Content-Type: application/json" \
-  -d '{"customerName":"Test Kunde","customerEmail":"test@example.com","items":[{"id":"airpower-3","name":"Airpower 3","price":4.5,"qty":2}]}'
-```
+Der Server berechnet einen vorgeschlagenen Abholtermin, speichert ihn einmalig mit der Reservierung und verwendet denselben Termin in Kundenmail, Betreibermail und Abholschein. Die Kundenmail nennt Abholort, Anfahrtslink, Zeitfenster, Reservierungsnummer, Artikel und den Abholschein. Die Artikel bleiben für den Termin zurückgelegt. Kann der Kunde nicht kommen, soll er sich melden; eine Freigabe wegen Nichterscheinens erfolgt erst nach vorheriger Verständigung per E-Mail. Es gibt **keine automatische Ablauffrist**.
 
-Ohne `.env`-Datei (bzw. ohne `RESEND_API_KEY`) werden die E-Mails nicht
-wirklich verschickt, sondern nur in der Konsole ausgegeben – praktisch zum
-Testen, ohne gleich einen Resend-Account zu brauchen.
+Die API-Antwort `emails.*.ok` bedeutet nur, dass Resend die Nachricht angenommen hat; sie beweist keine Zustellung im Kundenpostfach. Die Betreiber-Mail nennt daher den tatsächlichen Übergabestatus der Kundenmail. Ein Mailfehler löscht die bereits gespeicherte Reservierung nicht. Bei fehlgeschlagener Kundenmail zeigt der Checkout einen Fehlerhinweis mit Reservierungsnummer; eine automatische Nachsendewarteschlange fehlt.
 
-## Was noch fehlt, bevor der Shop live gehen kann
+## Vor dem Verkaufsstart offen
 
-1. **`.env` ausfüllen** (siehe `.env.example`): Resend-API-Key, Absenderadresse,
-   Lukas' E-Mail-Adresse, Abholadresse/-zeiten, Kontaktinfo.
-2. **Hosting**: der Server muss irgendwo dauerhaft laufen (z.B. Render oder
-   Railway, ca. 0–10€/Monat für diese Größe). Wichtig: auf einem kostenlosen
-   Hosting-Plan wird die Festplatte bei jedem Neu-Deploy oft zurückgesetzt –
-   für echten Betrieb braucht `data/` entweder eine "Persistent Disk" oder es
-   müsste später auf eine kleine Cloud-Datenbank umgezogen werden.
-3. **Frontend verbinden**: `js/shop.js` muss die Server-Adresse kennen (siehe
-   `API_BASE` ganz oben in der Datei) und ruft dann `/api/products` und
-   `/api/order` auf, statt den Bestand nur im Browser vorzutäuschen. Ohne
-   gesetzte `API_BASE` funktioniert die Website weiterhin wie bisher als reine
-   Vorschau (kein Absturz, einfach kein echter Server dahinter).
-4. **CORS einschränken**: aktuell erlaubt der Server Anfragen von jeder
-   Website (praktisch zum Testen). Vor dem Live-Gang sollte das in
-   `src/server.js` auf die echte Domain der Website eingeschränkt werden.
+1. Railway muss den **aktuellen** Backend-Quellstand erhalten; öffentliche Erreichbarkeit allein belegt nicht, dass lokale Idempotenz, private Routenkonfiguration und Mailstatus online sind. Version nach Deployment erneut vergleichen.
+2. Eigene Versanddomain bei Resend verifizieren, `RESEND_FROM` darauf setzen und echte Zustellung an freigegebene Testpostfächer prüfen. Providerannahme ist kein Zustellnachweis.
+3. `ABHOL_ADRESSE`, `ABHOL_ANFAHRT_URL`, Kontaktangaben, `OWNER_EMAIL`, `PUBLIC_BASE_URL`, CORS-Herkünfte und Abholzeiten auf Railway gegen den echten Betrieb prüfen. Private Abholdaten nie in öffentliche HTML-Dateien oder das GitHub-Repository schreiben.
+4. Railway-Volume auf Persistenz, Backups und Wiederanlauf prüfen. Bestand und Reservierung sind mehrere Dateischreibvorgänge, keine gemeinsame Transaktion; Crash-Recovery fehlt.
+5. Die in `datenschutz.html` genannte Löschfrist mit einem tatsächlichen manuellen oder automatisierten Prozess abgleichen. Der Code kennt derzeit keinen Kaufstatus und löscht keine Altreservierungen.
+6. Den Railway-Predeploy-Befehl entfernen oder absichern: Er enthält einen vollständigen alten Lagerstand und darf bei einem künftigen Deployment nicht das Volume überschreiben.
 
-## Bewusste Vereinfachungen (für diese Shop-Größe okay)
-
-- JSON-Dateien statt einer "richtigen" Datenbank – bei ein paar Dutzend
-  Bestellungen pro Saison völlig ausreichend.
-- Preis pro Artikel kommt von der Website, nicht aus einer serverseitigen
-  Preisliste – unkritisch, weil hier nicht online bezahlt wird (nur Abholung).
-  Falls das Projekt mal echtes Online-Bezahlen bekommt, muss der Preis
-  stattdessen serverseitig aus `data/products.json` kommen.
+Die lokale Website hat keinen Git-Ordner. `GITHUB-UPLOAD-backend` ist eine separate Upload-Kopie und kann älter als `backend/src` sein. Zugangsdaten, `.env` und `data/*.json` gehören weder ins GitHub- noch ins Netlify-Paket.

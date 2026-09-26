@@ -34,7 +34,8 @@ function generateReservationPdf(order) {
       doc.on("end", () => resolve(Buffer.concat(chunks)));
       doc.on("error", reject);
 
-      const abholadresse = process.env.ABHOL_ADRESSE || "Sandleiten 32, 4230 Pregarten, Österreich";
+      const abholadresse = process.env.ABHOL_ADRESSE?.trim() || "Abholort noch nicht eingerichtet";
+      const anfahrtUrl = process.env.ABHOL_ANFAHRT_URL?.trim() || "";
       const kontaktTelefon = process.env.KONTAKT_TELEFON || "+43 650 3015730";
       const kontaktEmail = process.env.KONTAKT_EMAIL || "lindner.fireworks@gmail.com";
       const reservationDate = order.reservationDate || new Date().toLocaleDateString("de-AT");
@@ -90,7 +91,7 @@ function generateReservationPdf(order) {
 
       // ---- Abholung (Adresse, Termin – automatisch generiert wie in der Bestätigungs-Mail) ----
       const abholY = metaY + 26;
-      doc.rect(50, abholY, 495, 56).fillColor("#f5f6fb").fill();
+      doc.rect(50, abholY, 495, 72).fillColor("#f5f6fb").fill();
       doc
         .fillColor(PINK)
         .font("Helvetica-Bold")
@@ -98,11 +99,13 @@ function generateReservationPdf(order) {
         .text("ABHOLUNG", 65, abholY + 10)
         .fillColor(DARK)
         .font("Helvetica")
-        .text(`Adresse: ${abholadresse}`, 65, abholY + 25)
-        .text(`Termin: ${abholtermin}`, 65, abholY + 39);
+        .text(`Abholort: ${abholadresse}`, 65, abholY + 25)
+        .text(`Termin: ${abholtermin}`, 65, abholY + 39)
+        .fillColor(PINK)
+        .text("Anfahrt öffnen", 65, abholY + 53, { link: anfahrtUrl, underline: true });
 
       // ---- Artikeltabelle ----
-      let y = abholY + 80;
+      let y = abholY + 96;
       doc
         .fontSize(9)
         .fillColor(GRAY)
@@ -116,6 +119,7 @@ function generateReservationPdf(order) {
 
       doc.font("Helvetica").fillColor(DARK).fontSize(10);
       for (const item of order.items || []) {
+        if (y > 650) { doc.addPage(); y = 50; }
         doc.text(item.name, 50, y, { width: 280 });
         doc.text(`× ${item.qty}`, 350, y, { width: 60, align: "center" });
         doc.text(formatPrice(item.price * item.qty), 470, y, { width: 75, align: "right" });
@@ -123,6 +127,7 @@ function generateReservationPdf(order) {
       }
 
       y += 4;
+      if (y > 590) { doc.addPage(); y = 50; }
       doc.moveTo(50, y).lineTo(545, y).strokeColor("#e3e5f0").stroke();
       y += 10;
 
@@ -136,7 +141,7 @@ function generateReservationPdf(order) {
         .fontSize(13)
         .fillColor(PINK)
         .text("Zahlung bar bei Abholung.", 50, y, { width: 495, align: "center" })
-        .text("Vielen Dank für deinen Einkauf!", 50, y + 18, { width: 495, align: "center" });
+        .text("Unverbindliche Reservierung – Kauf erst vor Ort.", 50, y + 18, { width: 495, align: "center" });
 
       // ---- Kleinunternehmer-Hinweis (kein Umsatzsteuerausweis) ----
       y += 56;

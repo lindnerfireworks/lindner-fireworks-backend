@@ -44,16 +44,16 @@ const PORT = process.env.PORT || 4000;
 //
 // Umstellen ohne Code-Änderung über die Umgebungsvariable ORDERS_OPEN_FROM
 // (Format JJJJ-MM-TT, Ortszeit Österreich). Beispiele:
-//   ORDERS_OPEN_FROM=2026-12-01   -> ab 1. Dezember 2026, 00:00 Uhr
+//   ORDERS_OPEN_FROM=2026-11-01   -> ab 1. Dezember 2026, 00:00 Uhr
 //   ORDERS_OPEN_FROM=              -> sofort offen (leerer Wert = keine Sperre)
 // Optional lässt sich mit ORDERS_OPEN_UNTIL auch ein Ende setzen, z.B. nach
 // Silvester: ORDERS_OPEN_UNTIL=2027-01-01
 // ---------------------------------------------------------------------------
-const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "2026-12-01").trim();
-const ORDERS_OPEN_UNTIL = (process.env.ORDERS_OPEN_UNTIL || "").trim();
+const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "2026-11-01").trim();
+const ORDERS_OPEN_UNTIL = (process.env.ORDERS_OPEN_UNTIL ?? "2027-01-01").trim();
 
 /**
- * Wandelt "2026-12-01" in einen Zeitpunkt um, der Mitternacht österreichischer
+ * Wandelt "2026-11-01" in einen Zeitpunkt um, der Mitternacht österreichischer
  * Zeit entspricht. Im Dezember gilt MEZ (UTC+1), deshalb wird eine Stunde
  * abgezogen. Bei ungültiger Eingabe wird null geliefert (= keine Sperre), damit
  * ein Tippfehler in der Variable nie den ganzen Shop lahmlegt.
@@ -144,8 +144,17 @@ setInterval(() => {
 
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
-  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(body);
+}
+
+function hasPickupRoute() {
+  try {
+    const url = new URL(process.env.ABHOL_ANFAHRT_URL || "");
+    return url.protocol === "https:" && ["maps.app.goo.gl", "www.google.com", "maps.google.com", "maps.apple.com"].includes(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
 function readJsonBody(req) {
@@ -197,11 +206,25 @@ async function handlePostOrder(req, res) {
 
   const { customerName, customerEmail, customerPhone, items: rawItems, ageConfirmed } = body || {};
 
+  const requestId = body?.requestId;
+  if (typeof requestId !== "string" || !/^[a-f0-9-]{36}$/i.test(requestId)) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
+  }
+  const requestHash = crypto.createHash("sha256").update(JSON.stringify({customerName, customerEmail, customerPhone, rawItems, ageConfirmed})).digest("hex");
+  const previous = (await store.getOrders()).find(o => o.requestId === requestId);
+  if (previous) {
+    if (previous.requestHash !== requestHash) return sendJson(res, 409, {ok: false, error: "request_conflict"});
+    return sendJson(res, 200, {ok: true, order: previous, emails: previous.emails || {}});
+  }
+  if (!process.env.ABHOL_ADRESSE?.trim() || !hasPickupRoute() || !process.env.RESEND_API_KEY || !process.env.RESEND_FROM || /@resend\.dev/i.test(process.env.RESEND_FROM) || !process.env.OWNER_EMAIL) {
+    return sendJson(res, 503, {ok: false, error: "service_not_ready"});
+  }
+
   if (!customerName || !customerEmail || !Array.isArray(rawItems) || rawItems.length === 0) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
-  if (String(customerName).length > 100 || String(customerEmail).length > 200) {
+  if (typeof customerName !== "string" || !customerName.trim() || typeof customerEmail !== "string" || customerName.length > 100 || customerEmail.length > 200) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
@@ -248,6 +271,10 @@ async function handlePostOrder(req, res) {
     items.push({ id: product.id, name: product.name, price: product.price, qty });
   }
 
+  // Allocate metadata before touching stock: a counter-write error must not lose stock.
+  const abholtermin = computeAbholzeit();
+  const reservationNumber = await store.nextReservationNumber();
+  const reservationDate = new Date().toLocaleDateString("de-AT", {timeZone: "Europe/Vienna"});
   const decremented = []; // für Rollback, falls ein späterer Artikel nicht verfügbar ist
 
   for (const item of items) {
@@ -266,29 +293,33 @@ async function handlePostOrder(req, res) {
     decremented.push({ id: item.id, qty: item.qty });
   }
 
-  const total = items.reduce((sum, it) => sum + it.price * it.qty, 0);
+  const total = Math.round(items.reduce((sum, it) => sum + it.price * it.qty, 0) * 100) / 100;
 
   // Abholtermin + Reservierungsnummer EINMAL berechnen und in der Reservierung
   // speichern, damit Kunden-Mail, Besitzer-Mail und die (später über den
   // Link abrufbare) Abholschein-PDF garantiert denselben Termin/dieselbe
   // Nummer zeigen – auch wenn der Abholschein erst Tage später abgerufen wird.
-  const abholtermin = computeAbholzeit();
-  const reservationNumber = await store.nextReservationNumber();
-  const reservationDate = new Date().toLocaleDateString("de-AT");
-
   const order = {
+    requestId,
+    requestHash,
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     customerName,
     customerEmail,
     customerPhone: customerPhone ? String(customerPhone).slice(0, 40) : "",
+    ageConfirmed: true,
     items,
     total,
     abholtermin,
     reservationNumber,
     reservationDate,
   };
-  await store.appendOrder(order);
+  try {
+    await store.appendOrder(order);
+  } catch (err) {
+    for (const done of decremented) await store.incrementStock(done.id, done.qty);
+    throw err;
+  }
 
   const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
   const abholscheinUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/abholschein/${order.id}` : null;
@@ -304,8 +335,7 @@ async function handlePostOrder(req, res) {
 
   // E-Mails verschicken – ein Fehler hier soll die Bestellung selbst nicht
   // rückgängig machen (Bestand ist schon korrekt abgezogen und gespeichert).
-  const [customerMailResult, ownerMailResult] = await Promise.all([
-    sendCustomerConfirmation({
+  const customerMailResult = await sendCustomerConfirmation({
       customerName,
       customerEmail,
       items,
@@ -316,8 +346,9 @@ async function handlePostOrder(req, res) {
     }).catch((err) => {
       console.error("[order] Fehler beim Senden der Kunden-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-    sendOwnerNotification({
+    });
+
+  const ownerMailResult = await sendOwnerNotification({
       customerName,
       customerEmail,
       items,
@@ -326,13 +357,16 @@ async function handlePostOrder(req, res) {
       abholscheinUrl,
       reservationNumber,
       abholscheinPdf,
+      customerMailAccepted: customerMailResult.ok === true,
     }).catch((err) => {
       console.error("[order] Fehler beim Senden der Besitzer-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-  ]);
+    });
 
-  sendJson(res, 200, { ok: true, order, emails: { customerMailResult, ownerMailResult } });
+  const emails = {customerMailResult: {ok: customerMailResult.ok === true}, ownerMailResult: {ok: ownerMailResult.ok === true}};
+  try { await store.updateOrder(order.id, {emails}); }
+  catch (err) { console.error("[order] Mailstatus konnte nicht gespeichert werden."); }
+  sendJson(res, 200, { ok: true, order, emails });
 }
 
 // Liefert den PDF-Abholschein zu einer gespeicherten Reservierung aus (per
@@ -354,6 +388,8 @@ async function handleGetAbholschein(req, res, orderId) {
 
   res.writeHead(200, {
     "Content-Type": "application/pdf",
+    "Cache-Control": "no-store",
+    "X-Robots-Tag": "noindex, nofollow",
     "Content-Disposition": `inline; filename="Abholschein-${order.reservationNumber || order.id}.pdf"`,
     "Content-Length": pdfBuffer.length,
   });
@@ -370,22 +406,20 @@ async function handlePostContact(req, res) {
   }
 
   const { name, email, subject, message } = body || {};
-  if (!name || !email || !message) {
+  if (!validContact(name, email) || typeof message !== "string" || !message.trim() || message.length > 10000 || (subject && (typeof subject !== "string" || subject.length > 200))) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
-  const [ownerMailResult, customerMailResult] = await Promise.all([
-    sendContactNotification({ name, email, subject, message }).catch((err) => {
+  const ownerMailResult = await sendContactNotification({ name, email, subject, message }).catch((err) => {
       console.error("[contact] Fehler beim Senden der Kontakt-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-    sendContactConfirmation({ name, email }).catch((err) => {
+    });
+  const customerMailResult = ownerMailResult.ok ? await sendContactConfirmation({ name, email }).catch((err) => {
       console.error("[contact] Fehler beim Senden der Bestätigungs-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-  ]);
+    }) : {ok: false};
 
-  sendJson(res, 200, { ok: true, emails: { ownerMailResult, customerMailResult } });
+  sendJson(res, ownerMailResult.ok ? 200 : 502, { ok: ownerMailResult.ok === true, confirmationSent: customerMailResult.ok === true });
 }
 
 // Erwarteter Body: { name, email, phone, occasion, date, location, message }
@@ -398,22 +432,33 @@ async function handlePostBooking(req, res) {
   }
 
   const { name, email, phone, occasion, date, location, message } = body || {};
-  if (!name || !email) {
+  if (!validContact(name, email) || [phone, occasion, date, location, message].some(v => v != null && (typeof v !== "string" || v.length > 10000))) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
-  const [ownerMailResult, customerMailResult] = await Promise.all([
-    sendBookingNotification({ name, email, phone, occasion, date, location, message }).catch((err) => {
+  const ownerMailResult = await sendBookingNotification({ name, email, phone, occasion, date, location, message }).catch((err) => {
       console.error("[booking] Fehler beim Senden der Besitzer-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-    sendBookingConfirmation({ name, email, occasion, date }).catch((err) => {
+    });
+  const customerMailResult = ownerMailResult.ok ? await sendBookingConfirmation({ name, email, occasion, date }).catch((err) => {
       console.error("[booking] Fehler beim Senden der Kunden-Mail:", err);
       return { ok: false, error: String(err) };
-    }),
-  ]);
+    }) : {ok: false};
 
-  sendJson(res, 200, { ok: true, emails: { ownerMailResult, customerMailResult } });
+  sendJson(res, ownerMailResult.ok ? 200 : 502, { ok: ownerMailResult.ok === true, confirmationSent: customerMailResult.ok === true });
+}
+
+function validContact(name, email) {
+  return typeof name === "string" && name.trim().length > 0 && name.length <= 100 && typeof email === "string" && email.length <= 200 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+// Serialise complete reservations, including persisted retry lookup and stock rollback.
+// This store must run in ONE server process on ONE persistent volume.
+let orderQueue = Promise.resolve();
+function queueOrder(req, res) {
+  const run = orderQueue.then(() => handlePostOrder(req, res));
+  orderQueue = run.catch(() => {});
+  return run;
 }
 
 // ---------- Admin: manuelle Bestandskorrektur (z.B. bei Stornierung) ----------
@@ -635,6 +680,7 @@ async function runDailyDigest({ now = new Date(), force = false } = {}) {
     adminUrl,
   });
 
+  if (!result.ok) return { sent: false, morgenIso, result };
   await writeDigestState({ lastSentFor: morgenIso });
   console.log(`[digest] Tagesübersicht für ${morgenIso} verschickt (${orders.length} Abholungen).`);
   return { sent: true, morgenIso, count: orders.length, result };
@@ -651,6 +697,200 @@ function scheduleDailyDigest() {
   tick(); // einmal direkt nach dem Start
   setInterval(tick, 60 * 60 * 1000).unref();
   console.log(`[digest] Tagesübersicht aktiv, Versand ab ${DIGEST_HOUR}:00 Uhr am Vorabend.`);
+}
+
+// ---------------------------------------------------------------------------
+// Statistik: Welche Artikel kommen wie an?
+//
+// /api/track          nimmt Ereignisse vom Shop entgegen (Aufruf, Warenkorb)
+// /api/admin/stats    zeigt die Auswertung als Seite fuers Handy
+//
+// Datenschutz: es wird KEINE Kennung des Besuchers gespeichert, keine IP, kein
+// Cookie - nur Zaehler je Artikel und Tag. Damit ist kein Banner noetig.
+// ---------------------------------------------------------------------------
+
+const TRACK_ARTEN = new Set(["view", "cart"]);
+
+function heuteWien(now = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Vienna", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(now);
+}
+
+async function handleTrack(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    return sendJson(res, 400, { ok: false, error: "invalid_json" });
+  }
+
+  const { id, art } = body || {};
+  if (!id || !TRACK_ARTEN.has(art) || !getProduct(String(id))) {
+    // Still ablehnen - der Shop soll deswegen keine Fehlermeldung zeigen
+    return sendJson(res, 204, { ok: true });
+  }
+
+  try {
+    await store.trackEvent(String(id), art, heuteWien());
+  } catch (err) {
+    console.error("[stats] Konnte Ereignis nicht speichern:", err.message);
+  }
+  return sendJson(res, 200, { ok: true });
+}
+
+/** Fasst Rohzaehler, Bestellungen und Katalog zu einer Tabelle zusammen. */
+function baueStatistik(stats, orders, tageZurueck) {
+  const grenze = tageZurueck
+    ? new Date(Date.now() - tageZurueck * 864e5).toISOString().slice(0, 10)
+    : null;
+
+  const zeilen = new Map();
+  const zeile = (id) => {
+    if (!zeilen.has(id)) {
+      const p = getProduct(id);
+      zeilen.set(id, {
+        id,
+        name: p ? p.name : id,
+        preis: p ? p.price : 0,
+        view: 0, cart: 0, reserviert: 0, umsatz: 0,
+      });
+    }
+    return zeilen.get(id);
+  };
+
+  for (const [tag, produkte] of Object.entries(stats)) {
+    if (grenze && tag < grenze) continue;
+    for (const [id, z] of Object.entries(produkte)) {
+      const r = zeile(id);
+      r.view += z.view || 0;
+      r.cart += z.cart || 0;
+    }
+  }
+
+  for (const o of orders) {
+    const tag = (o.createdAt || "").slice(0, 10);
+    if (grenze && tag && tag < grenze) continue;
+    for (const it of o.items || []) {
+      const r = zeile(it.id);
+      r.reserviert += it.qty || 0;
+      r.umsatz += (it.qty || 0) * (it.price || 0);
+    }
+  }
+
+  const liste = [...zeilen.values()];
+  for (const r of liste) {
+    r.quoteWarenkorb = r.view ? (r.cart / r.view) * 100 : null;
+    r.quoteKauf = r.cart ? (r.reserviert / r.cart) * 100 : null;
+  }
+  liste.sort((a, b) => b.umsatz - a.umsatz || b.view - a.view);
+  return liste;
+}
+
+function renderStatsPage(liste, { tageZurueck }) {
+  const summe = (f) => liste.reduce((s, r) => s + (r[f] || 0), 0);
+  const zahl = (n) => Number(n || 0).toLocaleString("de-AT");
+  const euro = (n) => Number(n || 0).toFixed(2).replace(".", ",") + " €";
+  const proz = (n) => (n === null ? "–" : n.toFixed(0) + " %");
+
+  const zeilen = liste
+    .map((r, i) => `<tr>
+      <td class="rang">${i + 1}</td>
+      <td class="name">${esc(r.name)}</td>
+      <td class="z">${zahl(r.view)}</td>
+      <td class="z">${zahl(r.cart)}</td>
+      <td class="z">${proz(r.quoteWarenkorb)}</td>
+      <td class="z stark">${zahl(r.reserviert)}</td>
+      <td class="z stark">${euro(r.umsatz)}</td>
+    </tr>`)
+    .join("");
+
+  const filter = [
+    ["7", "7 Tage"], ["30", "30 Tage"], ["", "Gesamt"],
+  ].map(([w, t]) =>
+    `<a href="?key=${encodeURIComponent(process.env.ADMIN_KEY || "")}${w ? "&tage=" + w : ""}"
+        class="${String(tageZurueck || "") === w ? "an" : ""}">${t}</a>`).join("");
+
+  return `<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Artikel-Statistik — Lindner Fireworks</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;padding:16px;background:#141f47;color:#eef1fb;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:15px}
+  h1{font-size:20px;margin:0 0 2px}
+  .meta{color:#cdd3f2;font-size:13px;margin-bottom:14px}
+  .filter{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+  .filter a{background:#22336b;border:1px solid rgba(255,255,255,.16);border-radius:999px;
+            padding:7px 15px;color:#cdd3f2;text-decoration:none;font-size:14px}
+  .filter a.an{border-color:#ff2f9e;color:#fff}
+  .karten{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin-bottom:18px}
+  .karte{background:#22336b;border:1px solid rgba(255,255,255,.16);border-radius:12px;padding:12px 14px}
+  .karte b{display:block;font-size:21px;color:#72f2bf}
+  .karte span{font-size:12px;color:#cdd3f2}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;font-size:11px;letter-spacing:.7px;text-transform:uppercase;color:#6adfff;
+     padding:0 6px 8px;font-weight:700;white-space:nowrap}
+  td{padding:9px 6px;border-top:1px solid rgba(255,255,255,.10);vertical-align:top}
+  td.z{text-align:right;white-space:nowrap}
+  td.rang{color:#9aa0b4;width:22px}
+  td.name{font-weight:600}
+  td.stark{color:#ff6fc4;font-weight:700}
+  .leer{background:#22336b;border-radius:12px;padding:22px;text-align:center;color:#cdd3f2}
+  .hinweis{margin-top:18px;font-size:12px;color:#9aa0b4;line-height:1.5}
+</style>
+</head>
+<body>
+  <h1>Artikel-Statistik</h1>
+  <p class="meta">Stand ${esc(new Date().toLocaleString("de-AT", { timeZone: "Europe/Vienna" }))}</p>
+  <div class="filter">${filter}</div>
+  <div class="karten">
+    <div class="karte"><b>${zahl(summe("view"))}</b><span>Artikel angesehen</span></div>
+    <div class="karte"><b>${zahl(summe("cart"))}</b><span>in den Warenkorb</span></div>
+    <div class="karte"><b>${zahl(summe("reserviert"))}</b><span>Stück reserviert</span></div>
+    <div class="karte"><b>${euro(summe("umsatz"))}</b><span>Umsatz reserviert</span></div>
+  </div>
+  ${liste.length ? `<table>
+    <tr><th></th><th>Artikel</th><th>Ansicht</th><th>Korb</th><th>Quote</th><th>Res.</th><th>Umsatz</th></tr>
+    ${zeilen}
+  </table>` : '<div class="leer">Noch keine Daten. Sobald jemand den Shop nutzt, füllt sich diese Seite.</div>'}
+  <p class="hinweis">
+    <b>Ansicht</b> = Produktdetails geöffnet. <b>Korb</b> = in den Warenkorb gelegt.
+    <b>Quote</b> = wie viele der Ansichten im Warenkorb landen — der beste Hinweis darauf,
+    ob ein Artikel überzeugt. <b>Res.</b> = tatsächlich reservierte Stück.<br>
+    Es werden keine Besucherdaten gespeichert, nur Zähler je Artikel und Tag.
+  </p>
+</body>
+</html>`;
+}
+
+async function handleAdminStats(req, res, url) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) return sendJson(res, 503, { ok: false, error: "admin_disabled" });
+  if (url.searchParams.get("key") !== adminKey) {
+    return sendJson(res, 401, { ok: false, error: "unauthorized" });
+  }
+
+  const tage = parseInt(url.searchParams.get("tage"), 10);
+  const tageZurueck = Number.isFinite(tage) && tage > 0 ? tage : null;
+
+  const [stats, orders] = await Promise.all([store.getStats(), store.getOrders()]);
+  const liste = baueStatistik(stats, orders, tageZurueck);
+
+  if (url.searchParams.get("format") === "json") {
+    return sendJson(res, 200, { ok: true, tageZurueck, artikel: liste });
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Robots-Tag": "noindex, nofollow",
+  });
+  res.end(renderStatsPage(liste, { tageZurueck }));
 }
 
 async function handleAdminOrders(req, res, url) {
@@ -745,7 +985,7 @@ const server = http.createServer(async (req, res) => {
       if (!rateLimitOk(req, "order", 5, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
-      return await handlePostOrder(req, res);
+      return await queueOrder(req, res);
     }
 
     if (req.method === "POST" && url.pathname === "/api/contact") {
@@ -762,6 +1002,19 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
       return await handlePostBooking(req, res);
+    }
+
+    // Zaehlt Produktaufrufe und Warenkorb-Zugaben. 200 Ereignisse pro IP und
+    // Stunde reichen fuer echtes Stoebern und bremsen Skripte aus.
+    if (req.method === "POST" && url.pathname === "/api/track") {
+      if (!rateLimitOk(req, "track", 200, 60 * 60 * 1000)) {
+        return sendJson(res, 429, { ok: false, error: "rate_limited" });
+      }
+      return await handleTrack(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/stats") {
+      return await handleAdminStats(req, res, url);
     }
 
     if (req.method === "GET" && url.pathname === "/api/admin/orders") {

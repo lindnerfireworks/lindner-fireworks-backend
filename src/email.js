@@ -11,7 +11,9 @@
 //   OWNER_EMAIL      – wohin interne Benachrichtigungen gehen
 //   SITE_BASE_URL    – öffentliche Adresse der Website (für das Logo)
 //   PUBLIC_BASE_URL  – öffentliche Adresse DIESES Servers (für den Abholschein-Link)
-//   ABHOL_ADRESSE, KONTAKT_TELEFON, KONTAKT_EMAIL – Angaben in den Mails
+//   ABHOL_ADRESSE      – private Bezeichnung/Beschreibung des Abholorts
+//   ABHOL_ANFAHRT_URL  – privater HTTPS-Kartenlink nur für Kundenunterlagen
+//   KONTAKT_TELEFON, KONTAKT_EMAIL – Kontaktdaten
 
 const RESEND_API_URL = "https://api.resend.com/emails";
 
@@ -19,7 +21,8 @@ const SITE_BASE_URL = (process.env.SITE_BASE_URL || "https://lindner-fireworks.n
 const LOGO_URL = `${SITE_BASE_URL}/assets/logo-email.png`;
 
 const ABSENDER_NAME = "Lindner Fireworks";
-const ADRESSE = process.env.ABHOL_ADRESSE || "Sandleiten 32, 4230 Pregarten, Österreich";
+const ADRESSE = process.env.ABHOL_ADRESSE?.trim() || "Abholort noch nicht eingerichtet";
+const ANFAHRT_URL = process.env.ABHOL_ANFAHRT_URL?.trim() || "";
 const TELEFON = process.env.KONTAKT_TELEFON || "+43 650 3015730";
 const EMAIL_KONTAKT = process.env.KONTAKT_EMAIL || "lindner.fireworks@gmail.com";
 
@@ -75,6 +78,7 @@ function itemsListText(items) {
 //   PICKUP_CLOSED     gesperrte Tage, kommagetrennt
 // ---------------------------------------------------------------------------
 const LEAD_DAYS = Number(process.env.ORDER_LEAD_DAYS || 2);
+const PICKUP_FIRST_DAY = process.env.PICKUP_FIRST_DAY || "2026-11-01";
 const PICKUP_LAST_DAY = process.env.PICKUP_LAST_DAY || "2026-12-31";
 const PICKUP_DAILY_FROM = process.env.PICKUP_DAILY_FROM || "2026-12-27";
 const PICKUP_DAILY_UNTIL = process.env.PICKUP_DAILY_UNTIL || "2026-12-31";
@@ -110,7 +114,7 @@ function isoDay(d) {
 /** Zeitfenster für diesen Tag, oder null wenn an dem Tag nicht abgeholt wird. */
 function slotForDay(d) {
   const iso = isoDay(d);
-  if (iso > PICKUP_LAST_DAY) return null; // Saison vorbei
+  if (iso < PICKUP_FIRST_DAY || iso > PICKUP_LAST_DAY) return null; // Saison vorbei
   if (PICKUP_CLOSED.includes(iso)) return null;
   if (iso >= PICKUP_DAILY_FROM && iso <= PICKUP_DAILY_UNTIL) return SLOT_DAILY;
   const dow = d.getUTCDay(); // 5 = Freitag, 6 = Samstag
@@ -148,7 +152,7 @@ function computeAbholzeit(now = new Date()) {
 
 /** Für Anzeigezwecke: nie leer, sondern ein sprechender Ersatztext. */
 function abholzeitText(value) {
-  return value || "Wir rufen dich für den Termin persönlich an";
+  return value || "Wir vereinbaren den Termin mit dir per E-Mail";
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +171,7 @@ function layout({ theme, title, kicker, content, footer }) {
   const fuss =
     footer ||
     `<strong style="color:#24273a;">LINDNER FIREWORKS</strong><br>
-     ${escapeHtml(ADRESSE)}<br>
+     Sandleiten 32, 4230 Pregarten, Österreich (Unternehmensanschrift)<br>
      ${escapeHtml(TELEFON)} · ${escapeHtml(EMAIL_KONTAKT)}<br>
      <span style="color:#9aa0b4;">Pyrotechnik &amp; Show-Feuerwerke</span>`;
 
@@ -277,10 +281,7 @@ async function sendEmail({ to, subject, text, html, attachments }) {
   const from = process.env.RESEND_FROM || `${ABSENDER_NAME} <onboarding@resend.dev>`;
 
   if (!apiKey) {
-    console.warn(
-      `[email] RESEND_API_KEY nicht gesetzt – E-Mail an ${to} wird NICHT verschickt (nur simuliert).\n` +
-        `Betreff: ${subject}\n${text}\n`
-    );
+    console.warn("[email] Versand nicht konfiguriert; keine E-Mail verschickt.");
     return { ok: false, simulated: true };
   }
 
@@ -291,11 +292,11 @@ async function sendEmail({ to, subject, text, html, attachments }) {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15000),
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    console.error(`[email] Resend-Fehler (${res.status}) beim Senden an ${to}: ${body}`);
+    console.error(`[email] Resend hat den Versand abgelehnt: HTTP ${res.status}`);
     return { ok: false, status: res.status };
   }
 
@@ -339,9 +340,10 @@ async function sendCustomerConfirmation({
       rechnungHinweis +
       box(
         `<strong style="color:#007eb6;">ABHOLUNG</strong><br>
-         Adresse: ${escapeHtml(ADRESSE)}<br>
+         Abholort: ${escapeHtml(ADRESSE)}<br>
+         Anfahrt: <a href="${escapeHtml(ANFAHRT_URL)}">Route zur Abholadresse planen</a><br>
          Abholtermin: ${escapeHtml(termin)}<br>
-         <span style="color:#6b7086; font-size:13px;">Bitte diese E-Mail oder deinen Namen zur Abholung mitbringen.</span>`,
+         <span style="color:#6b7086; font-size:13px;">Wir halten deine Artikel für diesen Termin bereit. Falls du verhindert bist, melde dich bitte bei uns. Ohne Abholung geben wir die Ware erst nach vorheriger Verständigung per E-Mail wieder frei. Bitte Abholschein und amtlichen Lichtbildausweis mitbringen. Barzahlung bei Abholung. Die Reservierung ist unverbindlich; der Kauf erfolgt erst vor Ort.</span>`,
         "kontakt"
       ) +
       kontaktBlock(),
@@ -357,10 +359,15 @@ ${itemsListText(items)}
 Gesamt: ${formatPrice(total)}
 ${reservationNumber ? `Reservierungsnummer: ${reservationNumber}\n` : ""}
 Abholung:
-Adresse: ${ADRESSE}
+Abholort: ${ADRESSE}
+Anfahrt: ${ANFAHRT_URL}
 Abholtermin: ${termin}
 
-Bitte bring diese E-Mail (oder deinen Namen) zur Abholung mit.
+Wir halten deine Artikel für diesen Termin bereit. Falls du verhindert bist, melde dich bitte bei uns.
+Ohne Abholung geben wir die Ware erst nach vorheriger Verständigung per E-Mail wieder frei.
+
+Bitte bring den Abholschein und einen amtlichen Lichtbildausweis mit. Barzahlung bei Abholung.
+Die Reservierung ist unverbindlich; der Kauf erfolgt erst vor Ort.
 
 Fragen?
 ${TELEFON}
@@ -394,11 +401,18 @@ async function sendOwnerNotification({
   abholscheinUrl,
   reservationNumber,
   abholscheinPdf,
+  customerMailAccepted,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
   const termin = abholzeitText(abholtermin || computeAbholzeit());
   const zeitpunkt = new Date().toLocaleString("de-AT");
   const subject = `Neue Reservierung – ${customerName}`;
+  const customerStatusHtml = customerMailAccepted
+    ? "Vom E-Mail-Dienst angenommen. Die Zustellung im Kundenpostfach ist damit noch nicht bestätigt."
+    : "Kundenbestätigung konnte nicht an den E-Mail-Dienst übergeben werden. Bitte Kundin oder Kunden manuell verständigen.";
+  const customerStatusText = customerMailAccepted
+    ? "Kundenbestätigung: vom E-Mail-Dienst angenommen; Zustellung im Postfach noch nicht bestätigt."
+    : "Kundenbestätigung: Versand fehlgeschlagen; bitte manuell verständigen.";
 
   const rechnungBlock = (abholscheinPdf || abholscheinUrl)
     ? box(
@@ -422,7 +436,7 @@ async function sendOwnerNotification({
       ) +
       itemsTable(items, total, "intern") +
       box(
-        `<strong style="color:#c0580d;">ABHOLTERMIN (Kunde wurde bereits informiert)</strong><br>${escapeHtml(termin)}`,
+        `<strong style="color:#c0580d;">VORGESCHLAGENER ABHOLTERMIN</strong><br>${escapeHtml(termin)}<br><span style="font-size:13px;">${escapeHtml(customerStatusHtml)}</span>`,
         "intern",
         true
       ) +
@@ -440,7 +454,8 @@ ${itemsListText(items)}
 
 Gesamt: ${formatPrice(total)}
 
-Abholtermin (Kunde wurde bereits informiert): ${termin}
+Vorgeschlagener Abholtermin: ${termin}
+${customerStatusText}
 ${abholscheinPdf ? "\nAbholschein: siehe Anhang (PDF)\n" : ""}${abholscheinUrl ? `Online: ${abholscheinUrl}\n` : ""}
 Zeitpunkt: ${zeitpunkt}`;
 

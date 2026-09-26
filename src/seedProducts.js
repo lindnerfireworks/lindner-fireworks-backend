@@ -21,7 +21,7 @@ const SEED_PRODUCTS = [
   { id: "v-wie-vokuhila", name: "V wie Vokuhila", stock: 16 },
   { id: "signature-range-16sh", name: "Signature range 16sh", stock: 10 },
   { id: "hacker-man", name: "Hacker Man", stock: 12 },
-  { id: "pete", name: "Pete", stock: 12 },
+  { id: "pete", name: "Pete", stock: 6 },
   { id: "fiori", name: "Fiori", stock: 6 },
   { id: "edaha", name: "Edaha", stock: 6 },
   { id: "azzurro", name: "Azzurro", stock: 6 },

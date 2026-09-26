@@ -22,6 +22,7 @@ const DATA_DIR = path.join(__dirname, "..", "data");
 const PRODUCTS_FILE = path.join(DATA_DIR, "products.json");
 const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 const INVOICE_COUNTER_FILE = path.join(DATA_DIR, "invoiceCounter.json");
+const STATS_FILE = path.join(DATA_DIR, "stats.json");
 
 // ---- Warteschlange, damit Lese-/Schreibvorgänge nie überlappen ----
 let queue = Promise.resolve();
@@ -121,6 +122,16 @@ async function getOrders() {
   return readJson(ORDERS_FILE, []);
 }
 
+async function updateOrder(id, changes) {
+  return runExclusive(async () => {
+    const orders = await readJson(ORDERS_FILE, []);
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("order_not_found");
+    Object.assign(order, changes);
+    await writeJson(ORDERS_FILE, orders);
+  });
+}
+
 async function getOrderById(id) {
   const orders = await readJson(ORDERS_FILE, []);
   return orders.find((o) => o.id === id) || null;
@@ -136,6 +147,33 @@ async function getOrderById(id) {
  * data/invoiceCounter.json). Läuft exklusiv, damit auch bei zwei fast
  * gleichzeitigen Bestellungen nie zweimal dieselbe Nummer vergeben wird.
  */
+// ---------------------------------------------------------------------------
+// Besucherstatistik
+//
+// Bewusst OHNE Cookies, ohne IP-Speicherung, ohne Kennung des einzelnen
+// Besuchers - es werden nur Zaehler je Artikel und Tag hochgezaehlt. Damit
+// entstehen keine personenbezogenen Daten, es braucht also weder ein
+// Cookie-Banner noch eine Einwilligung.
+//
+// Aufbau der Datei:
+//   { "2026-11-08": { "aidos": { "view": 12, "cart": 3 } }, ... }
+// ---------------------------------------------------------------------------
+
+async function trackEvent(produktId, art, tag) {
+  return runExclusive(async () => {
+    const stats = await readJson(STATS_FILE, {});
+    if (!stats[tag]) stats[tag] = {};
+    if (!stats[tag][produktId]) stats[tag][produktId] = { view: 0, cart: 0 };
+    stats[tag][produktId][art] = (stats[tag][produktId][art] || 0) + 1;
+    await writeJson(STATS_FILE, stats);
+    return true;
+  });
+}
+
+async function getStats() {
+  return readJson(STATS_FILE, {});
+}
+
 async function nextReservationNumber(date = new Date()) {
   return runExclusive(async () => {
     const year = date.getFullYear();
@@ -148,6 +186,9 @@ async function nextReservationNumber(date = new Date()) {
 }
 
 module.exports = {
+  updateOrder,
+  trackEvent,
+  getStats,
   getProducts,
   decrementStock,
   incrementStock,
