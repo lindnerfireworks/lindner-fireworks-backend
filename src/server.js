@@ -28,6 +28,7 @@ const {
   slotForDay,
   isoDay,
   formatGermanDate,
+  getEmailRuntimeConfig,
 } = require("./email");
 const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
@@ -102,7 +103,7 @@ function setCorsHeaders(req, res) {
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,18 @@ function sendJson(res, statusCode, data) {
   res.end(body);
 }
 
+function adminAuthorized(req, url) {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey) return { ok: false, status: 503, error: "admin_disabled" };
+  const authorization = String(req.headers.authorization || "");
+  const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  const supplied = bearer || url.searchParams.get("key") || "";
+  const expected = Buffer.from(adminKey);
+  const actual = Buffer.from(supplied);
+  const matches = expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  return matches ? { ok: true } : { ok: false, status: 401, error: "unauthorized" };
+}
+
 function hasPickupRoute() {
   try {
     const url = new URL(process.env.ABHOL_ANFAHRT_URL || "");
@@ -184,6 +197,86 @@ async function handleGetProducts(req, res) {
   sendJson(res, 200, products);
 }
 
+function pickupDateFromText(value) {
+  const match = String(value || "").match(/(\d{2})\.(\d{2})\.(\d{4})/);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : null;
+}
+
+async function dispatchReservationEmails(order) {
+  order = await store.getOrderById(order.id) || order;
+  let emails = {
+    customerMailResult: {
+      ok: false,
+      state: "pending",
+      idempotencyKey: `reservation/customer/${order.id}`,
+      ...(order.emails?.customerMailResult || {}),
+    },
+    ownerMailResult: {
+      ok: false,
+      state: "pending",
+      idempotencyKey: `reservation/owner/${order.id}`,
+      ...(order.emails?.ownerMailResult || {}),
+    },
+  };
+
+  if ((order.status || "reserved") === "cancelled" || order.stockRelease) {
+    return { order, emails, cancelled: true };
+  }
+
+  const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
+  const abholscheinUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/abholschein/${order.id}` : null;
+  let abholscheinPdf = null;
+  try {
+    abholscheinPdf = await generateReservationPdf(order);
+  } catch (err) {
+    console.error("[order] Abholschein konnte nicht erzeugt werden, Mail geht ohne Anhang raus:", err);
+  }
+
+  if (emails.customerMailResult.state !== "accepted") {
+    const result = await sendCustomerConfirmation({
+      ...order,
+      idempotencyKey: emails.customerMailResult.idempotencyKey,
+      abholscheinPdf,
+    }).catch((err) => ({ ok: false, state: "unknown", error: err?.name || "mail_error" }));
+    emails.customerMailResult = {
+      ...emails.customerMailResult,
+      ok: result.ok === true,
+      state: result.state || (result.ok ? "accepted" : "failed"),
+      providerId: result.providerId || null,
+      status: result.status || null,
+      updatedAt: new Date().toISOString(),
+    };
+    try { order = await store.updateOrder(order.id, { emails }); }
+    catch (err) { console.error("[order] Kunden-Mailstatus konnte nicht gespeichert werden:", err); }
+  }
+
+  if (emails.ownerMailResult.state !== "accepted") {
+    order = await store.getOrderById(order.id) || order;
+    if ((order.status || "reserved") === "cancelled" || order.stockRelease) {
+      return { order, emails, cancelled: true };
+    }
+    const result = await sendOwnerNotification({
+      ...order,
+      abholscheinUrl,
+      abholscheinPdf,
+      customerMailAccepted: emails.customerMailResult.state === "accepted",
+      idempotencyKey: emails.ownerMailResult.idempotencyKey,
+    }).catch((err) => ({ ok: false, state: "unknown", error: err?.name || "mail_error" }));
+    emails.ownerMailResult = {
+      ...emails.ownerMailResult,
+      ok: result.ok === true,
+      state: result.state || (result.ok ? "accepted" : "failed"),
+      providerId: result.providerId || null,
+      status: result.status || null,
+      updatedAt: new Date().toISOString(),
+    };
+    try { order = await store.updateOrder(order.id, { emails }); }
+    catch (err) { console.error("[order] Betreiber-Mailstatus konnte nicht gespeichert werden:", err); }
+  }
+
+  return { order, emails };
+}
+
 // Erwarteter Body:
 // {
 //   customerName: "Max Mustermann",
@@ -211,11 +304,6 @@ async function handlePostOrder(req, res) {
     return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
   }
   const requestHash = crypto.createHash("sha256").update(JSON.stringify({customerName, customerEmail, customerPhone, rawItems, ageConfirmed})).digest("hex");
-  const previous = (await store.getOrders()).find(o => o.requestId === requestId);
-  if (previous) {
-    if (previous.requestHash !== requestHash) return sendJson(res, 409, {ok: false, error: "request_conflict"});
-    return sendJson(res, 200, {ok: true, order: previous, emails: previous.emails || {}});
-  }
   if (!process.env.ABHOL_ADRESSE?.trim() || !hasPickupRoute() || !process.env.RESEND_API_KEY || !process.env.RESEND_FROM || /@resend\.dev/i.test(process.env.RESEND_FROM) || !process.env.OWNER_EMAIL) {
     return sendJson(res, 503, {ok: false, error: "service_not_ready"});
   }
@@ -271,39 +359,19 @@ async function handlePostOrder(req, res) {
     items.push({ id: product.id, name: product.name, price: product.price, qty });
   }
 
-  // Allocate metadata before touching stock: a counter-write error must not lose stock.
+  // Bestand, Reservierung und Nummernzaehler werden gemeinsam ueber ein
+  // wiederanlaufbares Journal gespeichert. Erst danach beginnt der Mailversand.
   const abholtermin = computeAbholzeit();
-  const reservationNumber = await store.nextReservationNumber();
-  const reservationDate = new Date().toLocaleDateString("de-AT", {timeZone: "Europe/Vienna"});
-  const decremented = []; // für Rollback, falls ein späterer Artikel nicht verfügbar ist
-
-  for (const item of items) {
-    const result = await store.decrementStock(item.id, item.qty);
-    if (!result.ok) {
-      for (const done of decremented) {
-        await store.incrementStock(done.id, done.qty);
-      }
-      return sendJson(res, 409, {
-        ok: false,
-        error: result.reason,
-        productId: item.id,
-        available: result.available,
-      });
-    }
-    decremented.push({ id: item.id, qty: item.qty });
-  }
-
   const total = Math.round(items.reduce((sum, it) => sum + it.price * it.qty, 0) * 100) / 100;
-
-  // Abholtermin + Reservierungsnummer EINMAL berechnen und in der Reservierung
-  // speichern, damit Kunden-Mail, Besitzer-Mail und die (später über den
-  // Link abrufbare) Abholschein-PDF garantiert denselben Termin/dieselbe
-  // Nummer zeigen – auch wenn der Abholschein erst Tage später abgerufen wird.
-  const order = {
+  const createdAt = new Date();
+  const transaction = await store.createReservation({
     requestId,
     requestHash,
+    items,
+    date: createdAt,
+    orderBase: {
     id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
+    createdAt: createdAt.toISOString(),
     customerName,
     customerEmail,
     customerPhone: customerPhone ? String(customerPhone).slice(0, 40) : "",
@@ -311,62 +379,53 @@ async function handlePostOrder(req, res) {
     items,
     total,
     abholtermin,
-    reservationNumber,
-    reservationDate,
-  };
-  try {
-    await store.appendOrder(order);
-  } catch (err) {
-    for (const done of decremented) await store.incrementStock(done.id, done.qty);
-    throw err;
+    pickupDate: pickupDateFromText(abholtermin),
+    reservationDate: createdAt.toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" }),
+    },
+  });
+  if (!transaction.ok) {
+    const status = transaction.reason === "request_conflict" ? 409
+      : transaction.reason === "out_of_stock" ? 409 : 400;
+    return sendJson(res, status, {
+      ok: false,
+      error: transaction.reason,
+      productId: transaction.id,
+      available: transaction.available,
+    });
   }
 
-  const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
-  const abholscheinUrl = publicBaseUrl ? `${publicBaseUrl.replace(/\/$/, "")}/api/abholschein/${order.id}` : null;
-
-  // Abholschein als PDF erzeugen, damit er der Kundenmail angehängt werden kann.
-  // Schlägt das fehl, wird die Mail trotzdem verschickt – nur eben ohne Anhang.
-  let abholscheinPdf = null;
-  try {
-    abholscheinPdf = await generateReservationPdf(order);
-  } catch (err) {
-    console.error("[order] Abholschein konnte nicht erzeugt werden, Mail geht ohne Anhang raus:", err);
+  if ((transaction.order.status || "reserved") === "cancelled" || transaction.order.stockRelease) {
+    return sendJson(res, 409, {
+      ok: false,
+      error: "reservation_cancelled",
+      order: {
+        id: transaction.order.id,
+        reservationNumber: transaction.order.reservationNumber || null,
+        status: "cancelled",
+      },
+      stockRelease: transaction.order.stockRelease || null,
+    });
   }
 
-  // E-Mails verschicken – ein Fehler hier soll die Bestellung selbst nicht
-  // rückgängig machen (Bestand ist schon korrekt abgezogen und gespeichert).
-  const customerMailResult = await sendCustomerConfirmation({
-      customerName,
-      customerEmail,
-      items,
-      total,
-      abholtermin,
-      reservationNumber,
-      abholscheinPdf,
-    }).catch((err) => {
-      console.error("[order] Fehler beim Senden der Kunden-Mail:", err);
-      return { ok: false, error: String(err) };
+  const dispatched = await dispatchReservationEmails(transaction.order);
+  if (dispatched.cancelled) {
+    return sendJson(res, 409, {
+      ok: false,
+      error: "reservation_cancelled",
+      order: {
+        id: dispatched.order.id,
+        reservationNumber: dispatched.order.reservationNumber || null,
+        status: "cancelled",
+      },
+      stockRelease: dispatched.order.stockRelease || null,
     });
-
-  const ownerMailResult = await sendOwnerNotification({
-      customerName,
-      customerEmail,
-      items,
-      total,
-      abholtermin,
-      abholscheinUrl,
-      reservationNumber,
-      abholscheinPdf,
-      customerMailAccepted: customerMailResult.ok === true,
-    }).catch((err) => {
-      console.error("[order] Fehler beim Senden der Besitzer-Mail:", err);
-      return { ok: false, error: String(err) };
-    });
-
-  const emails = {customerMailResult: {ok: customerMailResult.ok === true}, ownerMailResult: {ok: ownerMailResult.ok === true}};
-  try { await store.updateOrder(order.id, {emails}); }
-  catch (err) { console.error("[order] Mailstatus konnte nicht gespeichert werden."); }
-  sendJson(res, 200, { ok: true, order, emails });
+  }
+  sendJson(res, 200, {
+    ok: true,
+    duplicate: transaction.duplicate,
+    order: dispatched.order,
+    emails: dispatched.emails,
+  });
 }
 
 // Liefert den PDF-Abholschein zu einer gespeicherten Reservierung aus (per
@@ -552,7 +611,7 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Reservierungen — Lindner Fireworks</title>
+<title>Reservierungen — Feuerwerk Lindner</title>
 <style>
   * { box-sizing: border-box; }
   body { margin:0; padding:16px; background:#28418c; color:#eef1fb;
@@ -601,12 +660,40 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
 //   DIGEST_HOUR=18       Uhrzeit (Ortszeit Österreich), Standard 18
 //   DIGEST_ENABLED=false schaltet die Funktion ab
 // ---------------------------------------------------------------------------
-const fsp = require("fs/promises");
-const path = require("path");
-
 const DIGEST_HOUR = Number(process.env.DIGEST_HOUR || 18);
 const DIGEST_ENABLED = (process.env.DIGEST_ENABLED || "true") !== "false";
-const DIGEST_STATE_FILE = path.join(__dirname, "..", "data", "digest-state.json");
+
+function runtimeConfigEntry(name, effectiveValue, sourceWhenConfigured = "environment") {
+  const configured = Object.prototype.hasOwnProperty.call(process.env, name);
+  return {
+    configuredValue: configured ? String(process.env[name]) : null,
+    effectiveValue,
+    source: configured ? sourceWhenConfigured : "code-default",
+  };
+}
+
+function createRuntimeConfigSnapshot() {
+  return {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    description: "Allowlisted effective runtime configuration. Credential secrets are deliberately excluded.",
+    values: {
+      ...getEmailRuntimeConfig(),
+      ORDERS_OPEN_FROM: runtimeConfigEntry("ORDERS_OPEN_FROM", ORDERS_OPEN_FROM),
+      ORDERS_OPEN_UNTIL: runtimeConfigEntry("ORDERS_OPEN_UNTIL", ORDERS_OPEN_UNTIL),
+      ALLOWED_ORIGINS: runtimeConfigEntry(
+        "ALLOWED_ORIGINS",
+        Array.from(ALLOWED_ORIGINS),
+        "environment-plus-code-defaults",
+      ),
+      PUBLIC_BASE_URL: runtimeConfigEntry("PUBLIC_BASE_URL", process.env.PUBLIC_BASE_URL || ""),
+      DIGEST_HOUR: runtimeConfigEntry("DIGEST_HOUR", DIGEST_HOUR),
+      DIGEST_ENABLED: runtimeConfigEntry("DIGEST_ENABLED", DIGEST_ENABLED),
+      DATA_DIR: runtimeConfigEntry("DATA_DIR", process.env.DATA_DIR || "backend/data (code-relative)"),
+    },
+    excludedCredentialNames: ["ADMIN_KEY", "RESEND_API_KEY"],
+  };
+}
 
 /** Stunde und Datum in österreichischer Zeit. */
 function viennaNowParts(now = new Date()) {
@@ -627,7 +714,7 @@ function viennaNowParts(now = new Date()) {
 
 async function readDigestState() {
   try {
-    return JSON.parse(await fsp.readFile(DIGEST_STATE_FILE, "utf8"));
+    return await store.getDigestState();
   } catch (err) {
     return { lastSentFor: null };
   }
@@ -635,8 +722,7 @@ async function readDigestState() {
 
 async function writeDigestState(state) {
   try {
-    await fsp.mkdir(path.dirname(DIGEST_STATE_FILE), { recursive: true });
-    await fsp.writeFile(DIGEST_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+    await store.updateDigestState(state);
   } catch (err) {
     console.error("[digest] Konnte Status nicht speichern:", err.message);
   }
@@ -817,7 +903,7 @@ function renderStatsPage(liste, { tageZurueck }) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Artikel-Statistik — Lindner Fireworks</title>
+<title>Artikel-Statistik — Feuerwerk Lindner</title>
 <style>
   *{box-sizing:border-box}
   body{margin:0;padding:16px;background:#141f47;color:#eef1fb;
@@ -869,11 +955,8 @@ function renderStatsPage(liste, { tageZurueck }) {
 }
 
 async function handleAdminStats(req, res, url) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey) return sendJson(res, 503, { ok: false, error: "admin_disabled" });
-  if (url.searchParams.get("key") !== adminKey) {
-    return sendJson(res, 401, { ok: false, error: "unauthorized" });
-  }
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
 
   const tage = parseInt(url.searchParams.get("tage"), 10);
   const tageZurueck = Number.isFinite(tage) && tage > 0 ? tage : null;
@@ -894,13 +977,8 @@ async function handleAdminStats(req, res, url) {
 }
 
 async function handleAdminOrders(req, res, url) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey) {
-    return sendJson(res, 503, { ok: false, error: "admin_disabled" });
-  }
-  if (url.searchParams.get("key") !== adminKey) {
-    return sendJson(res, 401, { ok: false, error: "unauthorized" });
-  }
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
 
   let orders = await store.getOrders();
   const filterTag = url.searchParams.get("tag");
@@ -926,13 +1004,8 @@ async function handleAdminOrders(req, res, url) {
 }
 
 async function handleAdminAdjustStock(req, res, url) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey) {
-    return sendJson(res, 503, { ok: false, error: "admin_disabled" });
-  }
-  if (url.searchParams.get("key") !== adminKey) {
-    return sendJson(res, 401, { ok: false, error: "unauthorized" });
-  }
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
 
   const id = url.searchParams.get("id");
   const delta = parseInt(url.searchParams.get("delta"), 10);
@@ -947,6 +1020,107 @@ async function handleAdminAdjustStock(req, res, url) {
 
   if (!result.ok) return sendJson(res, 409, result);
   sendJson(res, 200, { ok: true, id, remaining: result.remaining });
+}
+
+async function handleAdminBackup(req, res, url) {
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+  const snapshot = await store.createBackupSnapshot(createRuntimeConfigSnapshot());
+  sendJson(res, 200, snapshot);
+}
+
+async function handleAdminPrivacyCleanup(req, res, url) {
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+  const body = await readJsonBody(req);
+  const apply = body.apply === true;
+  if (apply && body.confirm !== "APPLY-PRIVACY-CLEANUP") {
+    return sendJson(res, 400, { ok: false, error: "confirmation_required" });
+  }
+  const now = body.now ? new Date(body.now) : new Date();
+  if (Number.isNaN(now.valueOf())) return sendJson(res, 400, { ok: false, error: "invalid_now" });
+  const report = await store.privacyCleanup({ now, apply });
+  sendJson(res, 200, { ok: true, ...report });
+}
+
+async function handleAdminOrderStatus(req, res, url) {
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+  const body = await readJsonBody(req);
+  if (typeof body.id !== "string" || !/^[a-f0-9-]{36}$/i.test(body.id)) {
+    return sendJson(res, 400, { ok: false, error: "invalid_order_id" });
+  }
+  const when = body.when ? new Date(body.when) : new Date();
+  if (Number.isNaN(when.valueOf())) return sendJson(res, 400, { ok: false, error: "invalid_when" });
+  try {
+    const order = await store.setOrderStatus(body.id, body.status, when);
+    return sendJson(res, 200, {
+      ok: true,
+      order: {
+        id: order.id,
+        reservationNumber: order.reservationNumber,
+        status: order.status,
+        purchaseCompletedAt: order.purchaseCompletedAt || null,
+        cancelledAt: order.cancelledAt || null,
+      },
+    });
+  } catch (err) {
+    const status = err.message === "order_not_found" ? 404
+      : ["use_cancel_reservation_endpoint", "cancelled_reservation_locked"].includes(err.message) ? 409
+        : 400;
+    return sendJson(res, status, { ok: false, error: err.message });
+  }
+}
+
+async function handleAdminCancelReservation(req, res, url) {
+  const auth = adminAuthorized(req, url);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+
+  const body = await readJsonBody(req);
+  const hasId = typeof body.id === "string" && body.id.trim() !== "";
+  const hasReservationNumber = typeof body.reservationNumber === "string"
+    && body.reservationNumber.trim() !== "";
+  if (hasId === hasReservationNumber) {
+    return sendJson(res, 400, { ok: false, error: "exactly_one_reference_required" });
+  }
+  if (hasId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(body.id.trim())) {
+    return sendJson(res, 400, { ok: false, error: "invalid_order_id" });
+  }
+  if (hasReservationNumber && (body.reservationNumber.trim().length > 64
+    || !/^RES-\d{4}-\d{4,}$/i.test(body.reservationNumber.trim()))) {
+    return sendJson(res, 400, { ok: false, error: "invalid_reservation_number" });
+  }
+  if (body.apply !== undefined && typeof body.apply !== "boolean") {
+    return sendJson(res, 400, { ok: false, error: "invalid_apply" });
+  }
+  try {
+    const result = await store.cancelReservation({
+      id: hasId ? body.id.trim() : undefined,
+      reservationNumber: hasReservationNumber ? body.reservationNumber.trim() : undefined,
+      apply: body.apply === true,
+      confirm: body.confirm,
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      mode: result.mode,
+      alreadyCancelled: result.alreadyCancelled,
+      addedTotal: result.addedTotal,
+      requiredConfirmation: result.requiredConfirmation,
+      order: {
+        id: result.order.id,
+        reservationNumber: result.order.reservationNumber || null,
+        status: result.order.status || "reserved",
+        cancelledAt: result.order.cancelledAt || null,
+      },
+      items: result.items,
+      stockRelease: result.stockRelease,
+    });
+  } catch (err) {
+    const status = err.message === "order_not_found" ? 404
+      : err.message === "confirmation_required" ? 400
+        : 409;
+    return sendJson(res, status, { ok: false, error: err.message });
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1021,6 +1195,25 @@ const server = http.createServer(async (req, res) => {
       return await handleAdminOrders(req, res, url);
     }
 
+    if (req.method === "GET" && url.pathname === "/api/admin/backup") {
+      return await handleAdminBackup(req, res, url);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/privacy-cleanup") {
+      return await handleAdminPrivacyCleanup(req, res, url);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/order-status") {
+      return await handleAdminOrderStatus(req, res, url);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/cancel-reservation") {
+      return await handleAdminCancelReservation(req, res, url);
+    }
+
+    // Nur fuer unabhaengige manuelle Bestandskorrekturen. Reservierungsabsagen
+    // laufen ausschliesslich ueber cancel-reservation, damit sie atomar und
+    // wiederholbar mit dem Reservierungsstatus verknuepft bleiben.
     if (req.method === "GET" && url.pathname === "/api/admin/adjust-stock") {
       return await handleAdminAdjustStock(req, res, url);
     }
@@ -1037,7 +1230,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Lindner Fireworks Backend läuft auf Port ${PORT}`);
-  scheduleDailyDigest();
+async function startServer() {
+  const recovery = await store.initialize();
+  if (recovery.recovered) {
+    console.warn(`[store] Unvollstaendige Reservierungstransaktion ${recovery.transactionId || ""} wiederhergestellt.`);
+  }
+  server.listen(PORT, () => {
+    console.log(`Feuerwerk Lindner Backend läuft auf Port ${PORT}`);
+    scheduleDailyDigest();
+  });
+}
+
+startServer().catch((err) => {
+  console.error("[server] Start abgebrochen; Datenspeicher konnte nicht sicher initialisiert werden:", err);
+  process.exitCode = 1;
 });

@@ -1,7 +1,7 @@
 {
   "name": "lindner-fireworks-backend",
   "version": "1.0.0",
-  "description": "Kleiner Bestell-Server für den Lindner Fireworks Shop: echter Lagerbestand, automatische Bestell-E-Mails (Kunde + Lukas), PDF-Rechnungen. Bewusst fast ganz ohne externe Pakete gebaut (nur Node.js-Bordmittel) – einzige Ausnahme ist 'pdfkit' für die Rechnungs-PDFs, da Node dafür kein eingebautes Werkzeug hat.",
+  "description": "Kleiner Bestell-Server für den Feuerwerk Lindner Shop: echter Lagerbestand, automatische Bestell-E-Mails (Kunde + Lukas), PDF-Rechnungen. Bewusst fast ganz ohne externe Pakete gebaut (nur Node.js-Bordmittel) – einzige Ausnahme ist 'pdfkit' für die Rechnungs-PDFs, da Node dafür kein eingebautes Werkzeug hat.",
   "main": "src/server.js",
   "type": "commonjs",
   "engines": {
@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "seed": "node src/seedProducts.js"
+    "seed": "node src/seedProducts.js",
+    "test:cancel": "node tests/cancel-reservation.cjs"
   },
   "dependencies": {
     "pdfkit": "^0.15.0"

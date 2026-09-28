@@ -160,7 +160,7 @@ function generateReservationPdf(order) {
       doc
         .fontSize(8)
         .fillColor(GRAY)
-        .text(`LINDNER FIREWORKS · ${abholadresse} · ${kontaktTelefon} · ${kontaktEmail}`, 50, 770, {
+        .text(`LINDNER FEUERWERK · ${abholadresse} · ${kontaktTelefon} · ${kontaktEmail}`, 50, 770, {
           width: 495,
           align: "center",
         });

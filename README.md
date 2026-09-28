@@ -1,35 +1,79 @@
-# Lindner Fireworks – Backend
+# Lindner Feuerwerk – Backend
 
-Stand 26.09.2026. Dieser Ordner ist der lokale Quellstand. Was auf Railway läuft, muss nach jedem Upload gesondert geprüft werden.
+Stand 28.09.2026. Dieser Ordner ist der aktuelle Quellstand. Ob genau derselbe Commit auf Railway läuft, muss nach jedem Deployment anhand von Deployment-ID, Commit und Liveprüfung belegt werden.
 
 ## Ablauf und Daten
 
-- `src/server.js`: Node-HTTP-Server ohne Express. Die Website liest über `GET /api/products` den verbindlichen Bestand und über `GET /api/shop-status` das Verkaufsfenster. Eine Reservierung geht an `POST /api/order`.
-- `src/catalog.js`: verbindliche Produktnamen und Preise. Browserpreise werden beim Reservieren ignoriert.
-- `src/store.js`: Produkte, Reservierungen und Zähler in `data/*.json` auf einem persistenten Railway-Volume. Eine Warteschlange serialisiert Änderungen in **einem** Serverprozess. Nicht mehrere Instanzen auf dasselbe Volume setzen.
-- `src/email.js`: Kunden- und Betreiberbestätigung über Resend, jeweils als HTML und Klartext. `src/invoice.js` erstellt einen **Abholschein**, keine Rechnung.
-- Der genaue Abholort kommt ausschließlich aus `ABHOL_ADRESSE` in Railway; der private HTTPS-Kartenlink aus `ABHOL_ANFAHRT_URL`. Beides wird nur in individuellen Kundenunterlagen und internen Abläufen verwendet. Die öffentliche Firmenanschrift im Impressum ist nicht automatisch der Abholort. Solange keine bestätigte Postadresse vorliegt, darf `ABHOL_ADRESSE` nur eine zutreffende Ortsbeschreibung enthalten; keine Adresse erfinden.
-- `src/seedProducts.js` dient nur dem **Erstbestand**. Auf einem bestehenden Railway-Volume nie erneut seeden: Das würde Bestandsänderungen überschreiben.
+- `src/server.js`: Node-HTTP-Server ohne Express. `GET /api/products` liefert den Bestand, `GET /api/shop-status` das Verkaufsfenster und `POST /api/order` legt eine Reservierung an.
+- `src/catalog.js`: verbindliche Produktnamen und Preise. Vom Browser übermittelte Preise werden nicht vertraut.
+- `src/store.js`: Produkte, Reservierungen, Zähler, Statistik und Digest-Zustand in `data/*.json` auf dem Railway-Volume.
+- `src/email.js`: Kunden- und Betreiberbestätigung über Resend als HTML und Klartext. `src/invoice.js` erzeugt einen Abholschein, keine Rechnung.
+- Kontakt- und Showformulare werden nicht im Store abgelegt; das Backend übermittelt sie an Resend.
+
+## Konsistenz und Wiederanlauf
+
+Eine Prozesswarteschlange und eine Dateisperre serialisieren Änderungen. Eine Reservierung wird als Transaktion über Produktbestand, Bestellliste und Nummernzähler geführt: Zuerst wird ein Journal mit dem vollständigen Zielzustand dauerhaft geschrieben, anschließend werden die drei Dateien atomar ersetzt. Bleibt das Journal nach einem Prozessabbruch liegen, stellt `store.initialize()` den Zielzustand beim nächsten Start fertig.
+
+Dasselbe Journal schützt eine vollständige Reservierungsstornierung: Der Status `cancelled`, der dauerhafte `stockRelease`-Marker und die Addition der reservierten Mengen zum **aktuell gelesenen** Bestand werden gemeinsam geschrieben. Ein Wiederholungsaufruf gibt `addedTotal: 0` zurück und bucht nicht doppelt.
+
+Wichtige Grenzen:
+
+- Die Lösung ist für **einen aktiven Backend-Prozess auf einem einzelnen Railway-Volume** ausgelegt. Mehrere Replikate oder parallel startende Prozesse auf demselben Volume werden nicht unterstützt.
+- Die Dateisperre wird zur Laufzeit nicht nach Zeitablauf übernommen. Nur der kontrollierte Start entfernt eine nach einem Absturz übrig gebliebene Sperre.
+- Wiederholte Reservierungsanfragen mit demselben Vorgangsschlüssel sind idempotent; widersprüchliche Wiederholungen werden abgewiesen.
+
+## E-Mail-Zustand
+
+Kunden- und Betreiber-Mail erhalten stabile Resend-Idempotenzschlüssel. Der gespeicherte Zustand unterscheidet:
+
+- `accepted`: Resend hat die Nachricht angenommen.
+- `failed`: Resend hat die Nachricht ausdrücklich abgewiesen; ein späterer Versuch ist möglich.
+- `unknown`: Timeout oder Verbindungsabbruch; die tatsächliche Annahme ist unbekannt. Eine Wiederholung verwendet denselben Idempotenzschlüssel.
+
+`accepted` belegt keine Zustellung im Postfach. Ein Mailfehler rollt die bereits gespeicherte Reservierung nicht zurück. Die Website zeigt deshalb immer die Reservierungsnummer an und weist den Mailzustand gesondert aus.
+
+Ein Retry einer inzwischen stornierten Reservierung wird mit `409 reservation_cancelled` abgewiesen und löst keinen erneuten Mailversand aus. Vor Kunden- und Betreiber-Mail wird der aktuelle Reservierungsstatus erneut gelesen. Eine bereits laufende Übergabe an Resend lässt sich technisch nicht zurückrufen; der gespeicherte Storno- und Bestandszustand bleibt dennoch maßgeblich.
+
+## Private Abholdaten
+
+Der genaue Abholort kommt ausschließlich aus `ABHOL_ADRESSE`, der private Google-Maps-Link aus `ABHOL_ANFAHRT_URL` und der Apple-Karten-Link zum selben Punkt aus `ABHOL_ANFAHRT_APPLE_URL`. Diese Werte gehören nur in die Backend-Umgebung. Ohne eigene Apple-URL fällt die Kundenmail auf eine Suche nach der Abholbeschreibung zurück. Die Website nennt nur „in der Nähe von Pregarten“ sowie die Abholzeiten.
+
+Keine `.env`, Zugangsdaten, privaten Kartenlinks oder echten `data/*.json` in GitHub- oder Netlify-Pakete aufnehmen.
+
+## Administration
+
+Die neuen Admin-Endpunkte erwarten `Authorization: Bearer …`; der ältere Query-Key bleibt für die bestehenden Verwaltungsseiten vorläufig kompatibel.
+
+- `GET /api/admin/backup`: vollständiger Sicherungssnapshot mit Hashes.
+- `POST /api/admin/privacy-cleanup`: Vorschau standardmäßig; Ausführung nur mit der exakten Bestätigung `APPLY-PRIVACY-CLEANUP`.
+- `POST /api/admin/order-status`: Statusverwaltung für weiterhin aktive Vorgänge; ein Storno ist hier gesperrt und kann eine stornierte Reservierung nicht reaktivieren.
+- `POST /api/admin/cancel-reservation`: zunächst strikt lesende Vorschau per UUID oder Reservierungsnummer, danach bestätigte atomare Stornierung mit einmaliger Bestandsrückbuchung. Vollständiger Vertrag: [CANCELLATION-API.md](CANCELLATION-API.md).
+- `GET /api/admin/adjust-stock`: unabhängige manuelle Bestandskorrektur; nicht für Reservierungsstornos verwenden.
+
+Reservierungen ohne Kauf werden spätestens zwölf Monate nach Abholtermin oder Absage zur Löschung vorgeschlagen. Gekaufte Vorgänge bleiben bis zum 1. Jänner nach sieben vollständigen Kalenderjahren erhalten. Die Bereinigung läuft nicht automatisch im Server; sie muss regelmäßig erst als Dry-Run geprüft und anschließend bewusst ausgelöst werden.
+
+## Sicherung und Wiederherstellung
+
+Siehe `ops/README.md`.
+
+Kurzfassung: `ops/backup-live.ps1` exportiert den Admin-Snapshot einschließlich einer erlaubten Liste der wirksamen Laufzeitkonfiguration, verschlüsselt ihn mit Windows-DPAPI außerhalb von Vault und Projekt und hält 35 Tage vor. Zugangsschlüssel bleiben absichtlich in einem getrennten Secret-Store. Solange der ältere Railway-Stand den Vollsicherungsendpunkt nicht anbietet, erzeugt das Skript nur eine ausdrücklich als **partial** markierte Diagnosesicherung und beendet sich mit Code 2. Eine Teilsicherung wird nie als erfolgreiche Vollsicherung gemeldet. Ein Restore bleibt bis zur Konfigurationsprüfung, Wiederherstellung der Secrets und Datenschutz-Dry-Run ausdrücklich noch nicht startbereit.
 
 ## Lokale Prüfung
 
-`tests/README.md` beschreibt den isolierten Test unter einem Verzeichnis **außerhalb** dieses Vaults. Der Test fängt Resend-Aufrufe ab, verwendet Testdaten und verändert keine echten Bestände oder Reservierungen.
+- `node tests/review.cjs`: bestehende Funktionsprüfung.
+- `node tests/resilience.cjs`: Absturz-Wiederanlauf, Konkurrenz, Idempotenz, Mailzustände, Adminzugriff und Datenschutz-Dry-Run.
+- `node tests/cancel-reservation.cjs`: Stornovorschau, aktueller Bestand, Authentifizierung, exakte Bestätigung, Wiederholung, Parallelität, Alles-oder-nichts und Crash-Wiederanlauf.
+- `powershell -File tests/restore-tests.ps1`: Wiederherstellung mit leeren, einzelnen und mehreren Datensätzen sowie Ablehnung unvollständiger Sicherungen.
+- `node tests/privacy-cleanup-readonly.cjs`: belegt bytegenau, dass ein Dry-Run mit offenem Transaktionsjournal sowie ein unbestätigter Apply abbrechen, ohne das Journal anzuwenden oder Dateien zu verändern.
 
-Ohne konfigurierten Abholort, privaten Anfahrtslink, verifizierten Absender, Resend-Key und Betreiberadresse weist der aktuelle Code neue Reservierungen mit `service_not_ready` ab. Die Werte in `.env.example` sind Platzhalter, keine Zugangsdaten.
-
-## Reservierungsbestätigung und Abholregel
-
-Der Server berechnet einen vorgeschlagenen Abholtermin, speichert ihn einmalig mit der Reservierung und verwendet denselben Termin in Kundenmail, Betreibermail und Abholschein. Die Kundenmail nennt Abholort, Anfahrtslink, Zeitfenster, Reservierungsnummer, Artikel und den Abholschein. Die Artikel bleiben für den Termin zurückgelegt. Kann der Kunde nicht kommen, soll er sich melden; eine Freigabe wegen Nichterscheinens erfolgt erst nach vorheriger Verständigung per E-Mail. Es gibt **keine automatische Ablauffrist**.
-
-Die API-Antwort `emails.*.ok` bedeutet nur, dass Resend die Nachricht angenommen hat; sie beweist keine Zustellung im Kundenpostfach. Die Betreiber-Mail nennt daher den tatsächlichen Übergabestatus der Kundenmail. Ein Mailfehler löscht die bereits gespeicherte Reservierung nicht. Bei fehlgeschlagener Kundenmail zeigt der Checkout einen Fehlerhinweis mit Reservierungsnummer; eine automatische Nachsendewarteschlange fehlt.
+Alle Tests verwenden isolierte Verzeichnisse außerhalb des produktiven Datenordners und einen lokalen Resend-Ersatz. Sie versenden keine E-Mails und verändern keine echten Reservierungen oder Bestände.
 
 ## Vor dem Verkaufsstart offen
 
-1. Railway muss den **aktuellen** Backend-Quellstand erhalten; öffentliche Erreichbarkeit allein belegt nicht, dass lokale Idempotenz, private Routenkonfiguration und Mailstatus online sind. Version nach Deployment erneut vergleichen.
-2. Eigene Versanddomain bei Resend verifizieren, `RESEND_FROM` darauf setzen und echte Zustellung an freigegebene Testpostfächer prüfen. Providerannahme ist kein Zustellnachweis.
-3. `ABHOL_ADRESSE`, `ABHOL_ANFAHRT_URL`, Kontaktangaben, `OWNER_EMAIL`, `PUBLIC_BASE_URL`, CORS-Herkünfte und Abholzeiten auf Railway gegen den echten Betrieb prüfen. Private Abholdaten nie in öffentliche HTML-Dateien oder das GitHub-Repository schreiben.
-4. Railway-Volume auf Persistenz, Backups und Wiederanlauf prüfen. Bestand und Reservierung sind mehrere Dateischreibvorgänge, keine gemeinsame Transaktion; Crash-Recovery fehlt.
-5. Die in `datenschutz.html` genannte Löschfrist mit einem tatsächlichen manuellen oder automatisierten Prozess abgleichen. Der Code kennt derzeit keinen Kaufstatus und löscht keine Altreservierungen.
-6. Den Railway-Predeploy-Befehl entfernen oder absichern: Er enthält einen vollständigen alten Lagerstand und darf bei einem künftigen Deployment nicht das Volume überschreiben.
-
-Die lokale Website hat keinen Git-Ordner. `GITHUB-UPLOAD-backend` ist eine separate Upload-Kopie und kann älter als `backend/src` sein. Zugangsdaten, `.env` und `data/*.json` gehören weder ins GitHub- noch ins Netlify-Paket.
+1. Aktuellen Backend-Ordner kontrolliert zu GitHub/Railway deployen und die neue Version anhand der Admin- und Backup-Endpunkte belegen.
+2. Railway-Dienst auf genau eine aktive Replik begrenzen und das persistente Volume dem richtigen Mountpunkt zuordnen.
+3. Resend-Absenderdomain sowie echte Zustellung an freigegebene Testpostfächer prüfen. Providerannahme allein genügt nicht.
+4. Railway-DPA kontobezogen abschließen beziehungsweise vorhandenen Abschluss dokumentieren; auch Netlify- und Resend-Vertragsstand dokumentieren.
+5. Nach dem Deployment eine vollständige verschlüsselte Sicherung erstellen und in einem isolierten Ziel wiederherstellen. Erst dann gilt der Backup-Pfad als vollständig betriebsbereit.
+6. Datenschutzbereinigung zunächst als Dry-Run prüfen, Kaufstatus der Vorgänge pflegen und die Ausführung dokumentieren.
+7. Einen vorhandenen Railway-Predeploy-Befehl mit altem Seedbestand entfernen oder so absichern, dass ein Deployment niemals den aktuellen Lagerstand überschreibt.

@@ -7,7 +7,7 @@
 //
 // Konfiguration über Umgebungsvariablen:
 //   RESEND_API_KEY   – API-Key von resend.com
-//   RESEND_FROM      – Absender, z.B. "Lindner Fireworks <bestellung@domain.at>"
+//   RESEND_FROM      – Absender, z.B. "Lindner Feuerwerk <bestellung@domain.at>"
 //   OWNER_EMAIL      – wohin interne Benachrichtigungen gehen
 //   SITE_BASE_URL    – öffentliche Adresse der Website (für das Logo)
 //   PUBLIC_BASE_URL  – öffentliche Adresse DIESES Servers (für den Abholschein-Link)
@@ -20,9 +20,11 @@ const RESEND_API_URL = "https://api.resend.com/emails";
 const SITE_BASE_URL = (process.env.SITE_BASE_URL || "https://lindner-fireworks.netlify.app").replace(/\/$/, "");
 const LOGO_URL = `${SITE_BASE_URL}/assets/logo-email.png`;
 
-const ABSENDER_NAME = "Lindner Fireworks";
+const ABSENDER_NAME = "Lindner Feuerwerk";
 const ADRESSE = process.env.ABHOL_ADRESSE?.trim() || "Abholort noch nicht eingerichtet";
 const ANFAHRT_URL = process.env.ABHOL_ANFAHRT_URL?.trim() || "";
+const ANFAHRT_APPLE_URL = process.env.ABHOL_ANFAHRT_APPLE_URL?.trim()
+  || `https://maps.apple.com/?q=${encodeURIComponent(ADRESSE)}`;
 const TELEFON = process.env.KONTAKT_TELEFON || "+43 650 3015730";
 const EMAIL_KONTAKT = process.env.KONTAKT_EMAIL || "lindner.fireworks@gmail.com";
 
@@ -50,6 +52,34 @@ function nl2br(value) {
 
 function formatPrice(n) {
   return n.toFixed(2).replace(".", ",") + " €";
+}
+
+function configEntry(name, effectiveValue) {
+  const configured = Object.prototype.hasOwnProperty.call(process.env, name);
+  return {
+    configuredValue: configured ? String(process.env[name]) : null,
+    effectiveValue,
+    source: configured ? "environment" : "code-default",
+  };
+}
+
+function getEmailRuntimeConfig() {
+  return {
+    SITE_BASE_URL: configEntry("SITE_BASE_URL", SITE_BASE_URL),
+    ABHOL_ADRESSE: configEntry("ABHOL_ADRESSE", ADRESSE),
+    ABHOL_ANFAHRT_URL: configEntry("ABHOL_ANFAHRT_URL", ANFAHRT_URL),
+    ABHOL_ANFAHRT_APPLE_URL: configEntry("ABHOL_ANFAHRT_APPLE_URL", ANFAHRT_APPLE_URL),
+    KONTAKT_TELEFON: configEntry("KONTAKT_TELEFON", TELEFON),
+    KONTAKT_EMAIL: configEntry("KONTAKT_EMAIL", EMAIL_KONTAKT),
+    ORDER_LEAD_DAYS: configEntry("ORDER_LEAD_DAYS", LEAD_DAYS),
+    PICKUP_FIRST_DAY: configEntry("PICKUP_FIRST_DAY", PICKUP_FIRST_DAY),
+    PICKUP_LAST_DAY: configEntry("PICKUP_LAST_DAY", PICKUP_LAST_DAY),
+    PICKUP_DAILY_FROM: configEntry("PICKUP_DAILY_FROM", PICKUP_DAILY_FROM),
+    PICKUP_DAILY_UNTIL: configEntry("PICKUP_DAILY_UNTIL", PICKUP_DAILY_UNTIL),
+    PICKUP_CLOSED: configEntry("PICKUP_CLOSED", PICKUP_CLOSED),
+    RESEND_FROM: configEntry("RESEND_FROM", process.env.RESEND_FROM || `${ABSENDER_NAME} <onboarding@resend.dev>`),
+    OWNER_EMAIL: configEntry("OWNER_EMAIL", process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]"),
+  };
 }
 
 function itemsListText(items) {
@@ -170,7 +200,7 @@ function layout({ theme, title, kicker, content, footer }) {
   const t = THEME[theme] || THEME.bestellung;
   const fuss =
     footer ||
-    `<strong style="color:#24273a;">LINDNER FIREWORKS</strong><br>
+    `<strong style="color:#24273a;">LINDNER FEUERWERK</strong><br>
      Sandleiten 32, 4230 Pregarten, Österreich (Unternehmensanschrift)<br>
      ${escapeHtml(TELEFON)} · ${escapeHtml(EMAIL_KONTAKT)}<br>
      <span style="color:#9aa0b4;">Pyrotechnik &amp; Show-Feuerwerke</span>`;
@@ -185,7 +215,7 @@ function layout({ theme, title, kicker, content, footer }) {
 
         <tr>
           <td style="padding:28px 40px; text-align:center; border-bottom:3px solid ${t.line};">
-            <img src="${LOGO_URL}" alt="Lindner Fireworks" width="220" style="display:block; margin:0 auto; border:0; max-width:220px; height:auto;">
+            <img src="${LOGO_URL}" alt="Lindner Feuerwerk" width="220" style="display:block; margin:0 auto; border:0; max-width:220px; height:auto;">
           </td>
         </tr>
 
@@ -258,7 +288,7 @@ function itemsTable(items, total, theme) {
 function kontaktBlock() {
   return block(
     `<p style="margin:0 0 4px;">Fragen?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-     <p style="margin:16px 0 0;">Liebe Grüße<br><strong>Lindner Fireworks</strong></p>`,
+     <p style="margin:16px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
     "24px 40px 32px"
   );
 }
@@ -276,7 +306,7 @@ function zeitstempel(text) {
  * Wirft KEINEN Fehler nach außen, wenn kein API-Key gesetzt ist – dann wird
  * nur eine Warnung geloggt (praktisch für lokales Testen ohne echten Account).
  */
-async function sendEmail({ to, subject, text, html, attachments }) {
+async function sendEmail({ to, subject, text, html, attachments, idempotencyKey }) {
   const apiKey = process.env.RESEND_API_KEY;
   const from = process.env.RESEND_FROM || `${ABSENDER_NAME} <onboarding@resend.dev>`;
 
@@ -288,19 +318,34 @@ async function sendEmail({ to, subject, text, html, attachments }) {
   const payload = { from, to, subject, text, html };
   if (attachments && attachments.length) payload.attachments = attachments;
 
-  const res = await fetch(RESEND_API_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(15000),
-  });
+  let res;
+  try {
+    res = await fetch(RESEND_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    // Nach einem Timeout kann der Dienst die Nachricht bereits angenommen
+    // haben. Deshalb nie "fehlgeschlagen" behaupten, sondern mit demselben
+    // Idempotenzschluessel kontrolliert erneut versuchen.
+    console.error("[email] Resend-Antwort nicht eindeutig:", err?.message || err);
+    return { ok: false, state: "unknown", error: err?.name || "network_error" };
+  }
 
   if (!res.ok) {
     console.error(`[email] Resend hat den Versand abgelehnt: HTTP ${res.status}`);
-    return { ok: false, status: res.status };
+    return { ok: false, state: "failed", status: res.status };
   }
 
-  return { ok: true };
+  let providerId = null;
+  try { providerId = (await res.json())?.id || null; } catch {}
+  return { ok: true, state: "accepted", providerId };
 }
 
 // ---------------------------------------------------------------------------
@@ -315,9 +360,10 @@ async function sendCustomerConfirmation({
   abholtermin,
   reservationNumber,
   abholscheinPdf,
+  idempotencyKey,
 }) {
   const termin = abholzeitText(abholtermin || computeAbholzeit());
-  const subject = "Deine Reservierung bei Lindner Fireworks – Bestätigung";
+  const subject = "Deine Reservierung bei Lindner Feuerwerk – Bestätigung";
 
   const rechnungHinweis = abholscheinPdf
     ? box(
@@ -334,14 +380,15 @@ async function sendCustomerConfirmation({
     content:
       block(
         `<p style="margin:0 0 16px;">Hallo ${escapeHtml(customerName)},</p>
-         <p style="margin:0 0 4px;">vielen Dank für deine Reservierung bei <strong>Lindner Fireworks</strong>! Hier deine Bestätigung:</p>`
+         <p style="margin:0 0 4px;">vielen Dank für deine Reservierung bei <strong>Lindner Feuerwerk</strong>! Hier deine Bestätigung:</p>`
       ) +
       itemsTable(items, total, "bestellung") +
       rechnungHinweis +
       box(
         `<strong style="color:#007eb6;">ABHOLUNG</strong><br>
          Abholort: ${escapeHtml(ADRESSE)}<br>
-         Anfahrt: <a href="${escapeHtml(ANFAHRT_URL)}">Route zur Abholadresse planen</a><br>
+         Anfahrt: <a href="${escapeHtml(ANFAHRT_URL)}">Google Maps</a> ·
+         <a href="${escapeHtml(ANFAHRT_APPLE_URL)}">Apple Karten</a><br>
          Abholtermin: ${escapeHtml(termin)}<br>
          <span style="color:#6b7086; font-size:13px;">Wir halten deine Artikel für diesen Termin bereit. Falls du verhindert bist, melde dich bitte bei uns. Ohne Abholung geben wir die Ware erst nach vorheriger Verständigung per E-Mail wieder frei. Bitte Abholschein und amtlichen Lichtbildausweis mitbringen. Barzahlung bei Abholung. Die Reservierung ist unverbindlich; der Kauf erfolgt erst vor Ort.</span>`,
         "kontakt"
@@ -351,7 +398,7 @@ async function sendCustomerConfirmation({
 
   const text = `Hallo ${customerName},
 
-vielen Dank für deine Reservierung bei Lindner Fireworks!
+vielen Dank für deine Reservierung bei Lindner Feuerwerk!
 
 Deine Artikel:
 ${itemsListText(items)}
@@ -360,7 +407,8 @@ Gesamt: ${formatPrice(total)}
 ${reservationNumber ? `Reservierungsnummer: ${reservationNumber}\n` : ""}
 Abholung:
 Abholort: ${ADRESSE}
-Anfahrt: ${ANFAHRT_URL}
+Anfahrt mit Google Maps: ${ANFAHRT_URL}
+Anfahrt mit Apple Karten: ${ANFAHRT_APPLE_URL}
 Abholtermin: ${termin}
 
 Wir halten deine Artikel für diesen Termin bereit. Falls du verhindert bist, melde dich bitte bei uns.
@@ -374,18 +422,18 @@ ${TELEFON}
 ${EMAIL_KONTAKT}
 
 Liebe Grüße
-Lindner Fireworks`;
+Lindner Feuerwerk`;
 
   const attachments = abholscheinPdf
     ? [
         {
-          filename: `Abholschein-${reservationNumber || "Lindner-Fireworks"}.pdf`,
+          filename: `Abholschein-${reservationNumber || "Lindner-Feuerwerk"}.pdf`,
           content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
         },
       ]
     : undefined;
 
-  return sendEmail({ to: customerEmail, subject, text, html, attachments });
+  return sendEmail({ to: customerEmail, subject, text, html, attachments, idempotencyKey });
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +450,7 @@ async function sendOwnerNotification({
   reservationNumber,
   abholscheinPdf,
   customerMailAccepted,
+  idempotencyKey,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
   const termin = abholzeitText(abholtermin || computeAbholzeit());
@@ -442,7 +491,7 @@ async function sendOwnerNotification({
       ) +
       rechnungBlock +
       zeitstempel(`Eingegangen am ${zeitpunkt} · Bestand wurde automatisch reserviert.`),
-    footer: `<strong style="color:#24273a;">LINDNER FIREWORKS</strong> — Backend-Benachrichtigung`,
+    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Reservierung im Shop eingegangen:
@@ -462,13 +511,13 @@ Zeitpunkt: ${zeitpunkt}`;
   const attachments = abholscheinPdf
     ? [
         {
-          filename: `Abholschein-${reservationNumber || "Lindner-Fireworks"}.pdf`,
+          filename: `Abholschein-${reservationNumber || "Lindner-Feuerwerk"}.pdf`,
           content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
         },
       ]
     : undefined;
 
-  return sendEmail({ to: ownerEmail, subject, text, html, attachments });
+  return sendEmail({ to: ownerEmail, subject, text, html, attachments, idempotencyKey });
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +525,7 @@ Zeitpunkt: ${zeitpunkt}`;
 // ---------------------------------------------------------------------------
 
 async function sendContactConfirmation({ name, email }) {
-  const subject = "Deine Nachricht bei Lindner Fireworks ist angekommen";
+  const subject = "Deine Nachricht bei Lindner Feuerwerk ist angekommen";
 
   const html = layout({
     theme: "kontakt",
@@ -489,7 +538,7 @@ async function sendContactConfirmation({ name, email }) {
       ) +
       block(
         `<p style="margin:0 0 4px;">Fragen in der Zwischenzeit?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Fireworks</strong></p>`,
+         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
         "20px 40px 40px"
       ),
   });
@@ -503,7 +552,7 @@ ${TELEFON}
 ${EMAIL_KONTAKT}
 
 Liebe Grüße
-Lindner Fireworks`;
+Lindner Feuerwerk`;
 
   return sendEmail({ to: email, subject, text, html });
 }
@@ -534,7 +583,7 @@ async function sendContactNotification({ name, email, subject, message }) {
         "20px 40px 0"
       ) +
       zeitstempel(`Eingegangen am ${zeitpunkt}`),
-    footer: `<strong style="color:#24273a;">LINDNER FIREWORKS</strong> — Backend-Benachrichtigung`,
+    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Nachricht über das Kontaktformular:
@@ -579,7 +628,7 @@ async function sendBookingNotification({ name, email, phone, occasion, date, loc
         "20px 40px 0"
       ) +
       zeitstempel(`Eingegangen am ${zeitpunkt}`),
-    footer: `<strong style="color:#24273a;">LINDNER FIREWORKS</strong> — Backend-Benachrichtigung`,
+    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Anfrage über "Show buchen":
@@ -604,7 +653,7 @@ Zeitpunkt: ${zeitpunkt}`;
 // ---------------------------------------------------------------------------
 
 async function sendBookingConfirmation({ name, email, occasion, date }) {
-  const subject = "Deine Show-Anfrage bei Lindner Fireworks";
+  const subject = "Deine Show-Anfrage bei Lindner Feuerwerk";
 
   const anlassText = occasion
     ? ` für <strong>„${escapeHtml(occasion)}"</strong>`
@@ -623,7 +672,7 @@ async function sendBookingConfirmation({ name, email, occasion, date }) {
       ) +
       block(
         `<p style="margin:0 0 4px;">Fragen?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Fireworks</strong></p>`,
+         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
         "20px 40px 40px"
       ),
   });
@@ -639,7 +688,7 @@ ${TELEFON}
 ${EMAIL_KONTAKT}
 
 Liebe Grüße
-Lindner Fireworks`;
+Lindner Feuerwerk`;
 
   return sendEmail({ to: email, subject, text, html });
 }
@@ -741,4 +790,5 @@ module.exports = {
   viennaDateOnly,
   isoDay,
   formatGermanDate,
+  getEmailRuntimeConfig,
 };
