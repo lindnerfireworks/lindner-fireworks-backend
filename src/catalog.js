@@ -9,7 +9,9 @@
 // versioniert ins Repo.
 //
 // Bei Preisaenderungen: hier UND in js/shop.js anpassen, dann neu deployen.
-// Stand: 2026-08-19
+// Nur aktuell reservierbare Artikel gehoeren in diesen Katalog. Historische
+// Bestands- und Reservierungsdaten bleiben beim Entfernen eines Artikels erhalten.
+// Stand: 2026-09-30
 
 const CATALOG = [
   { id: "aidos", name: "Aidos", price: 4.20 },
@@ -39,7 +41,6 @@ const CATALOG = [
   { id: "okazja", name: "Okazja", price: 84.90 },
   { id: "felis-leo", name: "Felis Leo", price: 94.50 },
   { id: "panthera", name: "Panthera", price: 94.90 },
-  { id: "nightshade", name: "Nightshade", price: 109.98 },
   { id: "startowac", name: "Startowac", price: 132.90 },
   { id: "sky-dance", name: "Sky Dance", price: 133.50 },
   { id: "krawallig", name: "Krawallig", price: 158.50 },

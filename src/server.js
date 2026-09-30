@@ -194,7 +194,9 @@ function readJsonBody(req) {
 
 async function handleGetProducts(req, res) {
   const products = await store.getProducts();
-  sendJson(res, 200, products);
+  // Das Volume bewahrt auch Bestandsdaten ausgelisteter Artikel fuer Historie
+  // und Rueckbuchungen. Oeffentlich erscheinen nur Artikel im aktiven Katalog.
+  sendJson(res, 200, products.filter((product) => getProduct(product.id)));
 }
 
 function pickupDateFromText(value) {

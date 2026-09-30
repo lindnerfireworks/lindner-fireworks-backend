@@ -39,7 +39,6 @@ const SEED_PRODUCTS = [
   { id: "okazja", name: "Okazja", stock: 4 },
   { id: "felis-leo", name: "Felis Leo", stock: 2 },
   { id: "panthera", name: "Panthera", stock: 2 },
-  { id: "nightshade", name: "Nightshade", stock: 4 },
   { id: "startowac", name: "Startowac", stock: 2 },
   { id: "sky-dance", name: "Sky Dance", stock: 2 },
   { id: "krawallig", name: "Krawallig", stock: 3 },

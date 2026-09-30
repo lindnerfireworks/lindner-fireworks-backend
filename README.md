@@ -10,6 +10,20 @@ Stand 28.09.2026. Dieser Ordner ist der aktuelle Quellstand. Ob genau derselbe C
 - `src/email.js`: Kunden- und Betreiberbestätigung über Resend als HTML und Klartext. `src/invoice.js` erzeugt einen Abholschein, keine Rechnung.
 - Kontakt- und Showformulare werden nicht im Store abgelegt; das Backend übermittelt sie an Resend.
 
+## Aktiver Katalog und ausgelistete Artikel
+
+Nur Artikel aus `src/catalog.js` werden unter `GET /api/products` angezeigt und
+bei neuen Reservierungen angenommen. Nightshade ist seit 30.09.2026 nicht mehr
+im aktiven Sortiment und auch nicht mehr im Seed fuer neue Datenspeicher.
+Vorhandene Volume-Datensaetze werden dabei nicht geloescht oder auf null gesetzt:
+historische Reservierungen, Abholscheine und idempotente Stornierungen bleiben
+erhalten. Eine spaetere Rueckbuchung reaktiviert keinen ausgelisteten Artikel.
+Ein alter Warenkorb mit einer ausgelisteten ID wird vollstaendig abgewiesen,
+bevor Bestand oder Reservierungen geschrieben oder E-Mails gesendet werden.
+
+Regressionstest: `node tests/catalog-retirement.cjs` (nur temporaere Testdaten;
+Resend wird lokal abgefangen, installierte `pdfkit`-Abhaengigkeit erforderlich).
+
 ## Konsistenz und Wiederanlauf
 
 Eine Prozesswarteschlange und eine Dateisperre serialisieren Änderungen. Eine Reservierung wird als Transaktion über Produktbestand, Bestellliste und Nummernzähler geführt: Zuerst wird ein Journal mit dem vollständigen Zielzustand dauerhaft geschrieben, anschließend werden die drei Dateien atomar ersetzt. Bleibt das Journal nach einem Prozessabbruch liegen, stellt `store.initialize()` den Zielzustand beim nächsten Start fertig.
