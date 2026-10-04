@@ -28,7 +28,21 @@ function formatPrice(n) {
 function generateReservationPdf(order) {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: "A4", margin: 50 });
+      const stableDate = new Date(order.createdAt || "2026-01-01T00:00:00.000Z");
+      const documentDate = Number.isNaN(stableDate.valueOf())
+        ? new Date("2026-01-01T00:00:00.000Z")
+        : stableDate;
+      const doc = new PDFDocument({
+        size: "A4",
+        margin: 50,
+        info: {
+          Title: `Abholschein ${order.reservationNumber || order.id || "Feuerwerk Lindner"}`,
+          Author: "Feuerwerk Lindner",
+          Subject: "Unverbindliche Reservierung – Kauf erst vor Ort",
+          CreationDate: documentDate,
+          ModDate: documentDate,
+        },
+      });
       const chunks = [];
       doc.on("data", (chunk) => chunks.push(chunk));
       doc.on("end", () => resolve(Buffer.concat(chunks)));
@@ -160,7 +174,7 @@ function generateReservationPdf(order) {
       doc
         .fontSize(8)
         .fillColor(GRAY)
-        .text(`LINDNER FEUERWERK · ${abholadresse} · ${kontaktTelefon} · ${kontaktEmail}`, 50, 770, {
+        .text(`FEUERWERK LINDNER · ${abholadresse} · ${kontaktTelefon} · ${kontaktEmail}`, 50, 770, {
           width: 495,
           align: "center",
         });

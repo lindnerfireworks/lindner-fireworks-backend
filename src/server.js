@@ -52,6 +52,13 @@ const PORT = process.env.PORT || 4000;
 // ---------------------------------------------------------------------------
 const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "2026-11-01").trim();
 const ORDERS_OPEN_UNTIL = (process.env.ORDERS_OPEN_UNTIL ?? "2027-01-01").trim();
+const ORDER_TEST_KEY = (process.env.ORDER_TEST_KEY || "").trim();
+const ORDER_TEST_EMAIL = (process.env.ORDER_TEST_EMAIL || "").trim().toLowerCase();
+const ORDER_TEST_MAX_VALUE = Number(process.env.ORDER_TEST_MAX || 2);
+const ORDER_TEST_MAX = Number.isInteger(ORDER_TEST_MAX_VALUE) && ORDER_TEST_MAX_VALUE >= 1 && ORDER_TEST_MAX_VALUE <= 10
+  ? ORDER_TEST_MAX_VALUE
+  : 0;
+const ORDER_TEST_UNTIL = (process.env.ORDER_TEST_UNTIL || "").trim();
 
 /**
  * Wandelt "2026-11-01" in einen Zeitpunkt um, der Mitternacht österreichischer
@@ -70,6 +77,10 @@ function shopStatus(now = Date.now()) {
   const from = parseViennaDate(ORDERS_OPEN_FROM);
   const until = parseViennaDate(ORDERS_OPEN_UNTIL);
 
+  if ((ORDERS_OPEN_FROM && from === null) || (ORDERS_OPEN_UNTIL && until === null)) {
+    return { open: false, reason: "configuration_error" };
+  }
+
   if (from !== null && now < from) {
     return { open: false, reason: "not_yet", opensAt: ORDERS_OPEN_FROM };
   }
@@ -83,9 +94,13 @@ function shopStatus(now = Date.now()) {
 // Domain) über die Umgebungsvariable ALLOWED_ORIGINS ergänzen, kommagetrennt.
 const DEFAULT_ORIGINS = [
   "https://lindner-fireworks.netlify.app",
+  "https://feuerwerk-lindner.at",
+  "https://www.feuerwerk-lindner.at",
   "http://localhost:3000",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
+  "http://localhost:5501",
+  "http://127.0.0.1:5501",
 ];
 
 const ALLOWED_ORIGINS = new Set(
@@ -103,7 +118,7 @@ function setCorsHeaders(req, res) {
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Lindner-Test-Key");
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +176,52 @@ function adminAuthorized(req, url) {
   return matches ? { ok: true } : { ok: false, status: 401, error: "unauthorized" };
 }
 
+function testAccessAuthorized(req) {
+  if (!ORDER_TEST_KEY || !ORDER_TEST_EMAIL || ORDER_TEST_MAX < 1) return false;
+  const until = Date.parse(ORDER_TEST_UNTIL);
+  if (!ORDER_TEST_UNTIL || Number.isNaN(until) || Date.now() >= until) return false;
+  const supplied = String(req.headers["x-lindner-test-key"] || "");
+  const expected = Buffer.from(ORDER_TEST_KEY);
+  const actual = Buffer.from(supplied);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function inquiryHash(kind, payload) {
+  return crypto.createHash("sha256").update(JSON.stringify({ kind, payload })).digest("hex");
+}
+
+async function dispatchInquiryEmails(inquiry) {
+  inquiry = (await store.getInquiries()).find((entry) => entry.id === inquiry.id) || inquiry;
+  const data = inquiry.payload;
+  const isBooking = inquiry.kind === "booking";
+  let emails = inquiry.emails;
+
+  if (emails.ownerMailResult.state !== "accepted") {
+    const result = await (isBooking
+      ? sendBookingNotification({ ...data, requestId: inquiry.id, idempotencyKey: emails.ownerMailResult.idempotencyKey })
+      : sendContactNotification({ ...data, requestId: inquiry.id, idempotencyKey: emails.ownerMailResult.idempotencyKey })
+    ).catch((err) => ({ ok: false, state: "unknown", error: err?.name || "mail_error" }));
+    emails = {
+      ...emails,
+      ownerMailResult: { ...emails.ownerMailResult, ...publicMailResult(result), updatedAt: new Date().toISOString() },
+    };
+    inquiry = await store.updateInquiry(inquiry.id, { emails });
+  }
+
+  if (emails.ownerMailResult.state === "accepted" && emails.customerMailResult.state !== "accepted") {
+    const result = await (isBooking
+      ? sendBookingConfirmation({ ...data, requestId: inquiry.id, idempotencyKey: emails.customerMailResult.idempotencyKey })
+      : sendContactConfirmation({ ...data, requestId: inquiry.id, idempotencyKey: emails.customerMailResult.idempotencyKey })
+    ).catch((err) => ({ ok: false, state: "unknown", error: err?.name || "mail_error" }));
+    emails = {
+      ...emails,
+      customerMailResult: { ...emails.customerMailResult, ...publicMailResult(result), updatedAt: new Date().toISOString() },
+    };
+    inquiry = await store.updateInquiry(inquiry.id, { emails });
+  }
+  return { inquiry, emails };
+}
+
 function hasPickupRoute() {
   try {
     const url = new URL(process.env.ABHOL_ANFAHRT_URL || "");
@@ -168,6 +229,27 @@ function hasPickupRoute() {
   } catch {
     return false;
   }
+}
+
+function emailServiceReady({ requirePickup = false } = {}) {
+  const mailReady = Boolean(
+    process.env.RESEND_API_KEY
+    && process.env.RESEND_FROM
+    && !/@resend\.dev/i.test(process.env.RESEND_FROM)
+    && process.env.OWNER_EMAIL
+  );
+  if (!mailReady) return false;
+  return !requirePickup || Boolean(process.env.ABHOL_ADRESSE?.trim() && hasPickupRoute());
+}
+
+function publicMailResult(result) {
+  return {
+    ok: result?.ok === true,
+    state: result?.state || (result?.ok ? "accepted" : "failed"),
+    providerId: result?.providerId || null,
+    status: result?.status || null,
+    error: result?.error || null,
+  };
 }
 
 function readJsonBody(req) {
@@ -246,6 +328,7 @@ async function dispatchReservationEmails(order) {
       state: result.state || (result.ok ? "accepted" : "failed"),
       providerId: result.providerId || null,
       status: result.status || null,
+      error: result.error || null,
       updatedAt: new Date().toISOString(),
     };
     try { order = await store.updateOrder(order.id, { emails }); }
@@ -261,7 +344,7 @@ async function dispatchReservationEmails(order) {
       ...order,
       abholscheinUrl,
       abholscheinPdf,
-      customerMailAccepted: emails.customerMailResult.state === "accepted",
+      occurredAt: order.createdAt,
       idempotencyKey: emails.ownerMailResult.idempotencyKey,
     }).catch((err) => ({ ok: false, state: "unknown", error: err?.name || "mail_error" }));
     emails.ownerMailResult = {
@@ -270,6 +353,7 @@ async function dispatchReservationEmails(order) {
       state: result.state || (result.ok ? "accepted" : "failed"),
       providerId: result.providerId || null,
       status: result.status || null,
+      error: result.error || null,
       updatedAt: new Date().toISOString(),
     };
     try { order = await store.updateOrder(order.id, { emails }); }
@@ -291,7 +375,7 @@ async function dispatchReservationEmails(order) {
 // Preis und Artikelname werden bewusst NICHT vom Frontend übernommen, sondern
 // serverseitig aus src/catalog.js nachgeschlagen. Alles andere ließe sich über
 // die Entwicklertools des Browsers manipulieren.
-async function handlePostOrder(req, res) {
+async function handlePostOrder(req, res, { testMode = false } = {}) {
   let body;
   try {
     body = await readJsonBody(req);
@@ -306,8 +390,20 @@ async function handlePostOrder(req, res) {
     return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
   }
   const requestHash = crypto.createHash("sha256").update(JSON.stringify({customerName, customerEmail, customerPhone, rawItems, ageConfirmed})).digest("hex");
-  if (!process.env.ABHOL_ADRESSE?.trim() || !hasPickupRoute() || !process.env.RESEND_API_KEY || !process.env.RESEND_FROM || /@resend\.dev/i.test(process.env.RESEND_FROM) || !process.env.OWNER_EMAIL) {
+  if (!emailServiceReady({ requirePickup: true })) {
     return sendJson(res, 503, {ok: false, error: "service_not_ready"});
+  }
+
+  if (testMode) {
+    if (String(customerEmail || "").trim().toLowerCase() !== ORDER_TEST_EMAIL) {
+      return sendJson(res, 403, { ok: false, error: "test_email_mismatch" });
+    }
+    const orders = await store.getOrders();
+    const isRetry = orders.some((entry) => entry.requestId === requestId);
+    const testCount = orders.filter((entry) => entry.testMode === true && String(entry.customerEmail || "").toLowerCase() === ORDER_TEST_EMAIL).length;
+    if (!isRetry && testCount >= ORDER_TEST_MAX) {
+      return sendJson(res, 403, { ok: false, error: "test_limit_reached" });
+    }
   }
 
   if (!customerName || !customerEmail || !Array.isArray(rawItems) || rawItems.length === 0) {
@@ -383,6 +479,7 @@ async function handlePostOrder(req, res) {
     abholtermin,
     pickupDate: pickupDateFromText(abholtermin),
     reservationDate: createdAt.toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" }),
+    testMode: testMode === true,
     },
   });
   if (!transaction.ok) {
@@ -457,7 +554,7 @@ async function handleGetAbholschein(req, res, orderId) {
   res.end(pdfBuffer);
 }
 
-// Erwarteter Body: { name, email, subject, message }
+// Erwarteter Body: { requestId, name, email, subject, message }
 async function handlePostContact(req, res) {
   let body;
   try {
@@ -466,24 +563,43 @@ async function handlePostContact(req, res) {
     return sendJson(res, 400, { ok: false, error: "invalid_json" });
   }
 
-  const { name, email, subject, message } = body || {};
+  const { requestId, name, email, subject, message } = body || {};
+  if (typeof requestId !== "string" || !/^[a-f0-9-]{36}$/i.test(requestId)) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
+  }
+  if (!emailServiceReady()) return sendJson(res, 503, { ok: false, error: "service_not_ready" });
   if (!validContact(name, email) || typeof message !== "string" || !message.trim() || message.length > 10000 || (subject && (typeof subject !== "string" || subject.length > 200))) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
-  const ownerMailResult = await sendContactNotification({ name, email, subject, message }).catch((err) => {
-      console.error("[contact] Fehler beim Senden der Kontakt-Mail:", err);
-      return { ok: false, error: String(err) };
-    });
-  const customerMailResult = ownerMailResult.ok ? await sendContactConfirmation({ name, email }).catch((err) => {
-      console.error("[contact] Fehler beim Senden der Bestätigungs-Mail:", err);
-      return { ok: false, error: String(err) };
-    }) : {ok: false};
-
-  sendJson(res, ownerMailResult.ok ? 200 : 502, { ok: ownerMailResult.ok === true, confirmationSent: customerMailResult.ok === true });
+  const payload = { name, email, subject: subject || "", message };
+  const created = await store.createInquiry({
+    requestId,
+    requestHash: inquiryHash("contact", payload),
+    kind: "contact",
+    payload,
+    testMode: testAccessAuthorized(req) && String(email).trim().toLowerCase() === ORDER_TEST_EMAIL,
+  });
+  if (!created.ok) return sendJson(res, 409, { ok: false, error: created.reason, requestId });
+  const dispatched = await dispatchInquiryEmails(created.inquiry);
+  const ownerMailResult = dispatched.emails.ownerMailResult;
+  const customerMailResult = dispatched.emails.customerMailResult;
+  const pending = ownerMailResult.state === "unknown" || customerMailResult.state === "unknown";
+  const status = ownerMailResult.ok ? 200 : pending ? 202 : 502;
+  sendJson(res, status, {
+    ok: ownerMailResult.ok === true,
+    duplicate: created.duplicate,
+    pending,
+    requestId,
+    confirmationSent: customerMailResult.ok === true,
+    emails: {
+      ownerMailResult: publicMailResult(ownerMailResult),
+      customerMailResult: publicMailResult(customerMailResult),
+    },
+  });
 }
 
-// Erwarteter Body: { name, email, phone, occasion, date, location, message }
+// Erwarteter Body: { requestId, name, email, phone, occasion, date, location, message }
 async function handlePostBooking(req, res) {
   let body;
   try {
@@ -492,21 +608,42 @@ async function handlePostBooking(req, res) {
     return sendJson(res, 400, { ok: false, error: "invalid_json" });
   }
 
-  const { name, email, phone, occasion, date, location, message } = body || {};
-  if (!validContact(name, email) || [phone, occasion, date, location, message].some(v => v != null && (typeof v !== "string" || v.length > 10000))) {
+  const { requestId, name, email, phone, occasion, date, location, message } = body || {};
+  if (typeof requestId !== "string" || !/^[a-f0-9-]{36}$/i.test(requestId)) {
+    return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
+  }
+  if (!emailServiceReady()) return sendJson(res, 503, { ok: false, error: "service_not_ready" });
+  if (!validContact(name, email) || typeof occasion !== "string" || !occasion.trim() || occasion.length > 200 || [phone, date, location, message].some(v => v != null && (typeof v !== "string" || v.length > 10000))) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
-  const ownerMailResult = await sendBookingNotification({ name, email, phone, occasion, date, location, message }).catch((err) => {
-      console.error("[booking] Fehler beim Senden der Besitzer-Mail:", err);
-      return { ok: false, error: String(err) };
-    });
-  const customerMailResult = ownerMailResult.ok ? await sendBookingConfirmation({ name, email, occasion, date }).catch((err) => {
-      console.error("[booking] Fehler beim Senden der Kunden-Mail:", err);
-      return { ok: false, error: String(err) };
-    }) : {ok: false};
-
-  sendJson(res, ownerMailResult.ok ? 200 : 502, { ok: ownerMailResult.ok === true, confirmationSent: customerMailResult.ok === true });
+  const payload = {
+    name, email, phone: phone || "", occasion, date: date || "", location: location || "", message: message || "",
+  };
+  const created = await store.createInquiry({
+    requestId,
+    requestHash: inquiryHash("booking", payload),
+    kind: "booking",
+    payload,
+    testMode: testAccessAuthorized(req) && String(email).trim().toLowerCase() === ORDER_TEST_EMAIL,
+  });
+  if (!created.ok) return sendJson(res, 409, { ok: false, error: created.reason, requestId });
+  const dispatched = await dispatchInquiryEmails(created.inquiry);
+  const ownerMailResult = dispatched.emails.ownerMailResult;
+  const customerMailResult = dispatched.emails.customerMailResult;
+  const pending = ownerMailResult.state === "unknown" || customerMailResult.state === "unknown";
+  const status = ownerMailResult.ok ? 200 : pending ? 202 : 502;
+  sendJson(res, status, {
+    ok: ownerMailResult.ok === true,
+    duplicate: created.duplicate,
+    pending,
+    requestId,
+    confirmationSent: customerMailResult.ok === true,
+    emails: {
+      ownerMailResult: publicMailResult(ownerMailResult),
+      customerMailResult: publicMailResult(customerMailResult),
+    },
+  });
 }
 
 function validContact(name, email) {
@@ -516,8 +653,8 @@ function validContact(name, email) {
 // Serialise complete reservations, including persisted retry lookup and stock rollback.
 // This store must run in ONE server process on ONE persistent volume.
 let orderQueue = Promise.resolve();
-function queueOrder(req, res) {
-  const run = orderQueue.then(() => handlePostOrder(req, res));
+function queueOrder(req, res, options) {
+  const run = orderQueue.then(() => handlePostOrder(req, res, options));
   orderQueue = run.catch(() => {});
   return run;
 }
@@ -683,6 +820,9 @@ function createRuntimeConfigSnapshot() {
       ...getEmailRuntimeConfig(),
       ORDERS_OPEN_FROM: runtimeConfigEntry("ORDERS_OPEN_FROM", ORDERS_OPEN_FROM),
       ORDERS_OPEN_UNTIL: runtimeConfigEntry("ORDERS_OPEN_UNTIL", ORDERS_OPEN_UNTIL),
+      ORDER_TEST_ENABLED: { configuredValue: null, effectiveValue: Boolean(ORDER_TEST_KEY && ORDER_TEST_EMAIL && ORDER_TEST_MAX && ORDER_TEST_UNTIL), source: "derived" },
+      ORDER_TEST_MAX: runtimeConfigEntry("ORDER_TEST_MAX", ORDER_TEST_MAX),
+      ORDER_TEST_UNTIL: runtimeConfigEntry("ORDER_TEST_UNTIL", ORDER_TEST_UNTIL),
       ALLOWED_ORIGINS: runtimeConfigEntry(
         "ALLOWED_ORIGINS",
         Array.from(ALLOWED_ORIGINS),
@@ -693,7 +833,7 @@ function createRuntimeConfigSnapshot() {
       DIGEST_ENABLED: runtimeConfigEntry("DIGEST_ENABLED", DIGEST_ENABLED),
       DATA_DIR: runtimeConfigEntry("DATA_DIR", process.env.DATA_DIR || "backend/data (code-relative)"),
     },
-    excludedCredentialNames: ["ADMIN_KEY", "RESEND_API_KEY"],
+    excludedCredentialNames: ["ADMIN_KEY", "RESEND_API_KEY", "ORDER_TEST_KEY", "ORDER_TEST_EMAIL"],
   };
 }
 
@@ -1147,13 +1287,18 @@ const server = http.createServer(async (req, res) => {
     // Die Website fragt hier ab, ob der Shop schon Reservierungen annimmt,
     // und blendet danach den Hinweis ein bzw. sperrt den Absende-Button.
     if (req.method === "GET" && url.pathname === "/api/shop-status") {
-      return sendJson(res, 200, { ok: true, ...shopStatus() });
+      const status = shopStatus();
+      if (!status.open && testAccessAuthorized(req)) {
+        return sendJson(res, 200, { ok: true, open: true, testMode: true, publicStatus: status });
+      }
+      return sendJson(res, 200, { ok: true, ...status });
     }
 
     if (req.method === "POST" && url.pathname === "/api/order") {
       // Verkaufsfenster prüfen, BEVOR irgendetwas abgebucht oder gemailt wird.
       const status = shopStatus();
-      if (!status.open) {
+      const testMode = !status.open && testAccessAuthorized(req);
+      if (!status.open && !testMode) {
         return sendJson(res, 403, { ok: false, error: "shop_closed", ...status });
       }
 
@@ -1161,7 +1306,7 @@ const server = http.createServer(async (req, res) => {
       if (!rateLimitOk(req, "order", 5, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
-      return await queueOrder(req, res);
+      return await queueOrder(req, res, { testMode });
     }
 
     if (req.method === "POST" && url.pathname === "/api/contact") {

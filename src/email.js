@@ -7,7 +7,7 @@
 //
 // Konfiguration über Umgebungsvariablen:
 //   RESEND_API_KEY   – API-Key von resend.com
-//   RESEND_FROM      – Absender, z.B. "Lindner Feuerwerk <bestellung@domain.at>"
+//   RESEND_FROM      – Absender, z.B. "Feuerwerk Lindner <bestellung@domain.at>"
 //   OWNER_EMAIL      – wohin interne Benachrichtigungen gehen
 //   SITE_BASE_URL    – öffentliche Adresse der Website (für das Logo)
 //   PUBLIC_BASE_URL  – öffentliche Adresse DIESES Servers (für den Abholschein-Link)
@@ -17,10 +17,10 @@
 
 const RESEND_API_URL = "https://api.resend.com/emails";
 
-const SITE_BASE_URL = (process.env.SITE_BASE_URL || "https://lindner-fireworks.netlify.app").replace(/\/$/, "");
+const SITE_BASE_URL = (process.env.SITE_BASE_URL || "https://feuerwerk-lindner.at").replace(/\/$/, "");
 const LOGO_URL = `${SITE_BASE_URL}/assets/logo-email.png`;
 
-const ABSENDER_NAME = "Lindner Feuerwerk";
+const ABSENDER_NAME = "Feuerwerk Lindner";
 const ADRESSE = process.env.ABHOL_ADRESSE?.trim() || "Abholort noch nicht eingerichtet";
 const ANFAHRT_URL = process.env.ABHOL_ANFAHRT_URL?.trim() || "";
 const ANFAHRT_APPLE_URL = process.env.ABHOL_ANFAHRT_APPLE_URL?.trim()
@@ -200,7 +200,7 @@ function layout({ theme, title, kicker, content, footer }) {
   const t = THEME[theme] || THEME.bestellung;
   const fuss =
     footer ||
-    `<strong style="color:#24273a;">LINDNER FEUERWERK</strong><br>
+    `<strong style="color:#24273a;">FEUERWERK LINDNER</strong><br>
      Sandleiten 32, 4230 Pregarten, Österreich (Unternehmensanschrift)<br>
      ${escapeHtml(TELEFON)} · ${escapeHtml(EMAIL_KONTAKT)}<br>
      <span style="color:#9aa0b4;">Pyrotechnik &amp; Show-Feuerwerke</span>`;
@@ -215,7 +215,7 @@ function layout({ theme, title, kicker, content, footer }) {
 
         <tr>
           <td style="padding:28px 40px; text-align:center; border-bottom:3px solid ${t.line};">
-            <img src="${LOGO_URL}" alt="Lindner Feuerwerk" width="220" style="display:block; margin:0 auto; border:0; max-width:220px; height:auto;">
+            <img src="${LOGO_URL}" alt="Feuerwerk Lindner" width="220" style="display:block; margin:0 auto; border:0; max-width:220px; height:auto;">
           </td>
         </tr>
 
@@ -288,7 +288,7 @@ function itemsTable(items, total, theme) {
 function kontaktBlock() {
   return block(
     `<p style="margin:0 0 4px;">Fragen?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-     <p style="margin:16px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
+     <p style="margin:16px 0 0;">Liebe Grüße<br><strong>Feuerwerk Lindner</strong></p>`,
     "24px 40px 32px"
   );
 }
@@ -306,7 +306,13 @@ function zeitstempel(text) {
  * Wirft KEINEN Fehler nach außen, wenn kein API-Key gesetzt ist – dann wird
  * nur eine Warnung geloggt (praktisch für lokales Testen ohne echten Account).
  */
-async function sendEmail({ to, subject, text, html, attachments, idempotencyKey }) {
+function companyReplyTo() {
+  return process.env.KONTAKT_EMAIL?.trim()
+    || process.env.OWNER_EMAIL?.trim()
+    || EMAIL_KONTAKT;
+}
+
+async function sendEmail({ to, subject, text, html, attachments, idempotencyKey, replyTo }) {
   const apiKey = process.env.RESEND_API_KEY;
   const from = process.env.RESEND_FROM || `${ABSENDER_NAME} <onboarding@resend.dev>`;
 
@@ -317,6 +323,7 @@ async function sendEmail({ to, subject, text, html, attachments, idempotencyKey 
 
   const payload = { from, to, subject, text, html };
   if (attachments && attachments.length) payload.attachments = attachments;
+  if (replyTo) payload.reply_to = replyTo;
 
   let res;
   try {
@@ -339,8 +346,19 @@ async function sendEmail({ to, subject, text, html, attachments, idempotencyKey 
   }
 
   if (!res.ok) {
-    console.error(`[email] Resend hat den Versand abgelehnt: HTTP ${res.status}`);
-    return { ok: false, state: "failed", status: res.status };
+    let details = {};
+    try { details = await res.json(); } catch {}
+    const errorCode = details?.name || details?.code || null;
+    const state = res.status === 409 && errorCode === "concurrent_idempotent_requests"
+      ? "unknown"
+      : "failed";
+    console.error(`[email] Resend hat den Versand abgelehnt: HTTP ${res.status}${errorCode ? ` (${errorCode})` : ""}`);
+    return {
+      ok: false,
+      state,
+      status: res.status,
+      error: errorCode,
+    };
   }
 
   let providerId = null;
@@ -363,7 +381,7 @@ async function sendCustomerConfirmation({
   idempotencyKey,
 }) {
   const termin = abholzeitText(abholtermin || computeAbholzeit());
-  const subject = "Deine Reservierung bei Lindner Feuerwerk – Bestätigung";
+  const subject = "Deine Reservierung bei Feuerwerk Lindner – Bestätigung";
 
   const rechnungHinweis = abholscheinPdf
     ? box(
@@ -380,7 +398,7 @@ async function sendCustomerConfirmation({
     content:
       block(
         `<p style="margin:0 0 16px;">Hallo ${escapeHtml(customerName)},</p>
-         <p style="margin:0 0 4px;">vielen Dank für deine Reservierung bei <strong>Lindner Feuerwerk</strong>! Hier deine Bestätigung:</p>`
+         <p style="margin:0 0 4px;">vielen Dank für deine Reservierung bei <strong>Feuerwerk Lindner</strong>! Hier deine Bestätigung:</p>`
       ) +
       itemsTable(items, total, "bestellung") +
       rechnungHinweis +
@@ -398,7 +416,7 @@ async function sendCustomerConfirmation({
 
   const text = `Hallo ${customerName},
 
-vielen Dank für deine Reservierung bei Lindner Feuerwerk!
+vielen Dank für deine Reservierung bei Feuerwerk Lindner!
 
 Deine Artikel:
 ${itemsListText(items)}
@@ -422,18 +440,26 @@ ${TELEFON}
 ${EMAIL_KONTAKT}
 
 Liebe Grüße
-Lindner Feuerwerk`;
+Feuerwerk Lindner`;
 
   const attachments = abholscheinPdf
     ? [
         {
-          filename: `Abholschein-${reservationNumber || "Lindner-Feuerwerk"}.pdf`,
+          filename: `Abholschein-${reservationNumber || "Feuerwerk-Lindner"}.pdf`,
           content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
         },
       ]
     : undefined;
 
-  return sendEmail({ to: customerEmail, subject, text, html, attachments, idempotencyKey });
+  return sendEmail({
+    to: customerEmail,
+    subject,
+    text,
+    html,
+    attachments,
+    idempotencyKey,
+    replyTo: companyReplyTo(),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -449,19 +475,15 @@ async function sendOwnerNotification({
   abholscheinUrl,
   reservationNumber,
   abholscheinPdf,
-  customerMailAccepted,
+  occurredAt,
   idempotencyKey,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
   const termin = abholzeitText(abholtermin || computeAbholzeit());
-  const zeitpunkt = new Date().toLocaleString("de-AT");
+  const zeitpunkt = new Date(occurredAt || 0).toLocaleString("de-AT", { timeZone: "Europe/Vienna" });
   const subject = `Neue Reservierung – ${customerName}`;
-  const customerStatusHtml = customerMailAccepted
-    ? "Vom E-Mail-Dienst angenommen. Die Zustellung im Kundenpostfach ist damit noch nicht bestätigt."
-    : "Kundenbestätigung konnte nicht an den E-Mail-Dienst übergeben werden. Bitte Kundin oder Kunden manuell verständigen.";
-  const customerStatusText = customerMailAccepted
-    ? "Kundenbestätigung: vom E-Mail-Dienst angenommen; Zustellung im Postfach noch nicht bestätigt."
-    : "Kundenbestätigung: Versand fehlgeschlagen; bitte manuell verständigen.";
+  const customerStatusHtml = "Die Kundenbestätigung wird separat verarbeitet. Der E-Mail-Dienststatus und die tatsächliche Zustellung sind getrennt zu prüfen.";
+  const customerStatusText = "Kundenbestätigung: separat verarbeitet; E-Mail-Dienststatus und tatsächliche Zustellung getrennt prüfen.";
 
   const rechnungBlock = (abholscheinPdf || abholscheinUrl)
     ? box(
@@ -491,7 +513,7 @@ async function sendOwnerNotification({
       ) +
       rechnungBlock +
       zeitstempel(`Eingegangen am ${zeitpunkt} · Bestand wurde automatisch reserviert.`),
-    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
+    footer: `<strong style="color:#24273a;">FEUERWERK LINDNER</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Reservierung im Shop eingegangen:
@@ -511,21 +533,29 @@ Zeitpunkt: ${zeitpunkt}`;
   const attachments = abholscheinPdf
     ? [
         {
-          filename: `Abholschein-${reservationNumber || "Lindner-Feuerwerk"}.pdf`,
+          filename: `Abholschein-${reservationNumber || "Feuerwerk-Lindner"}.pdf`,
           content: Buffer.isBuffer(abholscheinPdf) ? abholscheinPdf.toString("base64") : abholscheinPdf,
         },
       ]
     : undefined;
 
-  return sendEmail({ to: ownerEmail, subject, text, html, attachments, idempotencyKey });
+  return sendEmail({
+    to: ownerEmail,
+    subject,
+    text,
+    html,
+    attachments,
+    idempotencyKey,
+    replyTo: customerEmail,
+  });
 }
 
 // ---------------------------------------------------------------------------
 // 03 – Kontaktanfrage: Bestätigung an den Kunden
 // ---------------------------------------------------------------------------
 
-async function sendContactConfirmation({ name, email }) {
-  const subject = "Deine Nachricht bei Lindner Feuerwerk ist angekommen";
+async function sendContactConfirmation({ name, email, requestId, idempotencyKey }) {
+  const subject = "Deine Nachricht bei Feuerwerk Lindner ist angekommen";
 
   const html = layout({
     theme: "kontakt",
@@ -538,7 +568,8 @@ async function sendContactConfirmation({ name, email }) {
       ) +
       block(
         `<p style="margin:0 0 4px;">Fragen in der Zwischenzeit?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
+         <p style="margin:12px 0 0; color:#6b7086; font-size:13px;">Vorgangs-ID: ${escapeHtml(requestId)}</p>
+         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Feuerwerk Lindner</strong></p>`,
         "20px 40px 40px"
       ),
   });
@@ -551,19 +582,20 @@ Fragen in der Zwischenzeit?
 ${TELEFON}
 ${EMAIL_KONTAKT}
 
-Liebe Grüße
-Lindner Feuerwerk`;
+Vorgangs-ID: ${requestId}
 
-  return sendEmail({ to: email, subject, text, html });
+Liebe Grüße
+Feuerwerk Lindner`;
+
+  return sendEmail({ to: email, subject, text, html, idempotencyKey, replyTo: companyReplyTo() });
 }
 
 // ---------------------------------------------------------------------------
 // 03b – Kontaktanfrage: Benachrichtigung an Lukas
 // ---------------------------------------------------------------------------
 
-async function sendContactNotification({ name, email, subject, message }) {
+async function sendContactNotification({ name, email, subject, message, requestId, idempotencyKey }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
-  const zeitpunkt = new Date().toLocaleString("de-AT");
   const mailSubject = `Neue Kontaktanfrage${subject ? `: ${subject}` : ""} – ${name}`;
 
   const html = layout({
@@ -582,8 +614,8 @@ async function sendContactNotification({ name, email, subject, message }) {
          <p style="margin:0;">${nl2br(message)}</p>`,
         "20px 40px 0"
       ) +
-      zeitstempel(`Eingegangen am ${zeitpunkt}`),
-    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
+       zeitstempel(`Vorgangs-ID ${requestId}`),
+    footer: `<strong style="color:#24273a;">FEUERWERK LINDNER</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Nachricht über das Kontaktformular:
@@ -594,18 +626,17 @@ Betreff: ${subject || "(kein Betreff)"}
 Nachricht:
 ${message}
 
-Zeitpunkt: ${zeitpunkt}`;
+Vorgangs-ID: ${requestId}`;
 
-  return sendEmail({ to: ownerEmail, subject: mailSubject, text, html });
+  return sendEmail({ to: ownerEmail, subject: mailSubject, text, html, idempotencyKey, replyTo: email });
 }
 
 // ---------------------------------------------------------------------------
 // 04 – Show-Buchungsanfrage an Lukas
 // ---------------------------------------------------------------------------
 
-async function sendBookingNotification({ name, email, phone, occasion, date, location, message }) {
+async function sendBookingNotification({ name, email, phone, occasion, date, location, message, requestId, idempotencyKey }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
-  const zeitpunkt = new Date().toLocaleString("de-AT");
   const mailSubject = `Neue Show-Buchungsanfrage – ${name} (${occasion || "kein Anlass angegeben"})`;
 
   const html = layout({
@@ -627,8 +658,8 @@ async function sendBookingNotification({ name, email, phone, occasion, date, loc
          <p style="margin:0;">${nl2br(message || "–")}</p>`,
         "20px 40px 0"
       ) +
-      zeitstempel(`Eingegangen am ${zeitpunkt}`),
-    footer: `<strong style="color:#24273a;">LINDNER FEUERWERK</strong> — Backend-Benachrichtigung`,
+       zeitstempel(`Vorgangs-ID ${requestId}`),
+    footer: `<strong style="color:#24273a;">FEUERWERK LINDNER</strong> — Backend-Benachrichtigung`,
   });
 
   const text = `Neue Anfrage über "Show buchen":
@@ -643,17 +674,17 @@ Veranstaltungsort: ${location || "-"}
 Nachricht:
 ${message || "-"}
 
-Zeitpunkt: ${zeitpunkt}`;
+Vorgangs-ID: ${requestId}`;
 
-  return sendEmail({ to: ownerEmail, subject: mailSubject, text, html });
+  return sendEmail({ to: ownerEmail, subject: mailSubject, text, html, idempotencyKey, replyTo: email });
 }
 
 // ---------------------------------------------------------------------------
 // 05 – Show-Buchungsanfrage: Bestätigung an den Kunden
 // ---------------------------------------------------------------------------
 
-async function sendBookingConfirmation({ name, email, occasion, date }) {
-  const subject = "Deine Show-Anfrage bei Lindner Feuerwerk";
+async function sendBookingConfirmation({ name, email, occasion, date, requestId, idempotencyKey }) {
+  const subject = "Deine Show-Anfrage bei Feuerwerk Lindner";
 
   const anlassText = occasion
     ? ` für <strong>„${escapeHtml(occasion)}"</strong>`
@@ -672,7 +703,8 @@ async function sendBookingConfirmation({ name, email, occasion, date }) {
       ) +
       block(
         `<p style="margin:0 0 4px;">Fragen?<br><strong>${escapeHtml(TELEFON)}</strong><br><strong>${escapeHtml(EMAIL_KONTAKT)}</strong></p>
-         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Lindner Feuerwerk</strong></p>`,
+         <p style="margin:12px 0 0; color:#6b7086; font-size:13px;">Vorgangs-ID: ${escapeHtml(requestId)}</p>
+         <p style="margin:20px 0 0;">Liebe Grüße<br><strong>Feuerwerk Lindner</strong></p>`,
         "20px 40px 40px"
       ),
   });
@@ -687,10 +719,12 @@ Fragen?
 ${TELEFON}
 ${EMAIL_KONTAKT}
 
-Liebe Grüße
-Lindner Feuerwerk`;
+Vorgangs-ID: ${requestId}
 
-  return sendEmail({ to: email, subject, text, html });
+Liebe Grüße
+Feuerwerk Lindner`;
+
+  return sendEmail({ to: email, subject, text, html, idempotencyKey, replyTo: companyReplyTo() });
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 const INVOICE_COUNTER_FILE = path.join(DATA_DIR, "invoiceCounter.json");
 const STATS_FILE = path.join(DATA_DIR, "stats.json");
 const DIGEST_STATE_FILE = path.join(DATA_DIR, "digest-state.json");
+const INQUIRIES_FILE = path.join(DATA_DIR, "inquiries.json");
 const TRANSACTION_FILE = path.join(DATA_DIR, "reservation-transaction.json");
 const LOCK_FILE = path.join(DATA_DIR, "reservation.lock");
 
@@ -162,6 +163,52 @@ async function getProducts() {
 
 async function getOrders() {
   return readJson(ORDERS_FILE, []);
+}
+
+async function getInquiries() {
+  return readJson(INQUIRIES_FILE, []);
+}
+
+async function createInquiry({ requestId, requestHash, kind, payload, testMode = false }) {
+  return runExclusive(() => withStorageLock(async () => {
+    await recoverPendingLocked();
+    const inquiries = await readJson(INQUIRIES_FILE, []);
+    const previous = inquiries.find((entry) => entry.requestId === requestId);
+    if (previous) {
+      if (previous.requestHash !== requestHash || previous.kind !== kind) {
+        return { ok: false, reason: "request_conflict" };
+      }
+      return { ok: true, duplicate: true, inquiry: previous };
+    }
+    const inquiry = {
+      id: requestId,
+      requestId,
+      requestHash,
+      kind,
+      createdAt: new Date().toISOString(),
+      testMode: testMode === true,
+      payload,
+      emails: {
+        ownerMailResult: { ok: false, state: "pending", idempotencyKey: `${kind}/owner/${requestId}` },
+        customerMailResult: { ok: false, state: "pending", idempotencyKey: `${kind}/customer/${requestId}` },
+      },
+    };
+    inquiries.push(inquiry);
+    await writeJson(INQUIRIES_FILE, inquiries);
+    return { ok: true, duplicate: false, inquiry };
+  }));
+}
+
+async function updateInquiry(id, changes) {
+  return runExclusive(() => withStorageLock(async () => {
+    await recoverPendingLocked();
+    const inquiries = await readJson(INQUIRIES_FILE, []);
+    const inquiry = inquiries.find((entry) => entry.id === id);
+    if (!inquiry) throw new Error("inquiry_not_found");
+    Object.assign(inquiry, changes, { updatedAt: new Date().toISOString() });
+    await writeJson(INQUIRIES_FILE, inquiries);
+    return inquiry;
+  }));
 }
 
 async function getOrderById(id) {
@@ -322,9 +369,10 @@ async function updateDigestState(state) {
 async function createBackupSnapshot(runtimeConfig = null) {
   return runExclusive(() => withStorageLock(async () => {
     await recoverPendingLocked();
-    const [products, orders, invoiceCounter, stats, digestState] = await Promise.all([
+    const [products, orders, inquiries, invoiceCounter, stats, digestState] = await Promise.all([
       readJson(PRODUCTS_FILE, []),
       readJson(ORDERS_FILE, []),
+      readJson(INQUIRIES_FILE, []),
       readJson(INVOICE_COUNTER_FILE, {}),
       readJson(STATS_FILE, {}),
       readJson(DIGEST_STATE_FILE, {}),
@@ -332,13 +380,13 @@ async function createBackupSnapshot(runtimeConfig = null) {
     if (!runtimeConfig || typeof runtimeConfig !== "object" || Array.isArray(runtimeConfig)) {
       throw new Error("runtime_config_required");
     }
-    const data = { products, orders, invoiceCounter, stats, digestState, runtimeConfig };
+    const data = { products, orders, inquiries, invoiceCounter, stats, digestState, runtimeConfig };
     const hashes = Object.fromEntries(Object.entries(data).map(([name, value]) => [
       name,
       crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex"),
     ]));
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       completeness: "full",
       createdAt: new Date().toISOString(),
       data,
@@ -378,7 +426,9 @@ async function privacyCleanup({ now = new Date(), apply = false } = {}) {
   return runExclusive(() => withStorageLock(async () => {
     await recoverPendingLocked();
     const orders = await readJson(ORDERS_FILE, []);
+    const inquiries = await readJson(INQUIRIES_FILE, []);
     const candidates = [];
+    const inquiryCandidates = [];
     let holds = 0;
     let invalidDates = 0;
     for (const order of orders) {
@@ -398,21 +448,46 @@ async function privacyCleanup({ now = new Date(), apply = false } = {}) {
         expiry: expiry.toISOString(),
       });
     }
+    for (const inquiry of inquiries) {
+      if (inquiry.retentionHold === true) {
+        holds += 1;
+        continue;
+      }
+      const created = new Date(inquiry.createdAt);
+      if (Number.isNaN(created.valueOf())) {
+        invalidDates += 1;
+        continue;
+      }
+      created.setUTCDate(created.getUTCDate() + 365);
+      if (created <= now) inquiryCandidates.push({
+        id: inquiry.id,
+        reference: String(inquiry.id || "").slice(-8),
+        status: inquiry.kind || "inquiry",
+        expiry: created.toISOString(),
+      });
+    }
     if (apply && candidates.length) {
       const ids = new Set(candidates.map((entry) => entry.id));
       await writeJson(ORDERS_FILE, orders.filter((order) => !ids.has(order.id)));
     }
+    if (apply && inquiryCandidates.length) {
+      const ids = new Set(inquiryCandidates.map((entry) => entry.id));
+      await writeJson(INQUIRIES_FILE, inquiries.filter((inquiry) => !ids.has(inquiry.id)));
+    }
+    const allCandidates = candidates.concat(inquiryCandidates);
     return {
       mode: apply ? "apply" : "dry-run",
       now: now.toISOString(),
       counts: {
-        examined: orders.length,
-        candidates: candidates.length,
+        examined: orders.length + inquiries.length,
+        candidates: allCandidates.length,
+        orderCandidates: candidates.length,
+        inquiryCandidates: inquiryCandidates.length,
         retentionHolds: holds,
         invalidDates,
-        removed: apply ? candidates.length : 0,
+        removed: apply ? allCandidates.length : 0,
       },
-      candidates: candidates.map(({ reference, status, expiry }) => ({ reference, status, expiry })),
+      candidates: allCandidates.map(({ reference, status, expiry }) => ({ reference, status, expiry })),
     };
   }));
 }
@@ -608,6 +683,9 @@ module.exports = {
   incrementStock,
   appendOrder,
   getOrders,
+  getInquiries,
+  createInquiry,
+  updateInquiry,
   getOrderById,
   nextReservationNumber,
   createReservation,
