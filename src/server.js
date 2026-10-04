@@ -659,6 +659,13 @@ function queueOrder(req, res, options) {
   return run;
 }
 
+let inquiryQueue = Promise.resolve();
+function queueInquiry(handler, req, res) {
+  const run = inquiryQueue.then(() => handler(req, res));
+  inquiryQueue = run.catch(() => {});
+  return run;
+}
+
 // ---------- Admin: manuelle Bestandskorrektur (z.B. bei Stornierung) ----------
 // Nur per GET aufrufbar (bewusst so gebaut, damit Claude das direkt selbst
 // aufrufen kann, ohne dass du erst wieder Dateien hochladen musst) und nur
@@ -1314,7 +1321,7 @@ const server = http.createServer(async (req, res) => {
       if (!rateLimitOk(req, "contact", 3, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
-      return await handlePostContact(req, res);
+      return await queueInquiry(handlePostContact, req, res);
     }
 
     if (req.method === "POST" && url.pathname === "/api/booking") {
@@ -1322,7 +1329,7 @@ const server = http.createServer(async (req, res) => {
       if (!rateLimitOk(req, "booking", 3, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
-      return await handlePostBooking(req, res);
+      return await queueInquiry(handlePostBooking, req, res);
     }
 
     // Zaehlt Produktaufrufe und Warenkorb-Zugaben. 200 Ereignisse pro IP und
