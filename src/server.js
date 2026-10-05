@@ -898,7 +898,12 @@ async function runDailyDigest({ now = new Date(), force = false } = {}) {
   if (!force && state.lastSentFor === morgenIso) return { skipped: "schon_verschickt", morgenIso };
 
   const alle = await store.getOrders();
-  const orders = alle.filter((o) => terminSortKey(o.abholtermin) === morgenIso);
+  const orders = alle.filter((o) =>
+    o.testMode !== true
+    && (o.status || "reserved") === "reserved"
+    && !o.stockRelease
+    && terminSortKey(o.abholtermin) === morgenIso
+  );
   if (orders.length === 0) {
     await writeDigestState({ lastSentFor: morgenIso });
     return { skipped: "keine_abholungen", morgenIso };
