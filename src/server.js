@@ -33,6 +33,7 @@ const {
 const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
 const { pickupOptions, PICKUP_FIRST_DAY, TIME_ZONE, calendarDate, viennaDateOnly } = require("./pickup");
+const { renderOrdersPage } = require("./admin-orders-page");
 
 const PORT = process.env.PORT || 4000;
 
@@ -168,12 +169,12 @@ function sendJson(res, statusCode, data) {
   res.end(body);
 }
 
-function adminAuthorized(req, url) {
+function adminAuthorized(req, url, { bearerOnly = false } = {}) {
   const adminKey = process.env.ADMIN_KEY;
   if (!adminKey) return { ok: false, status: 503, error: "admin_disabled" };
   const authorization = String(req.headers.authorization || "");
   const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  const supplied = bearer || url.searchParams.get("key") || "";
+  const supplied = bearer || (!bearerOnly && url.searchParams.get("key")) || "";
   const expected = Buffer.from(adminKey);
   const actual = Buffer.from(supplied);
   const matches = expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
@@ -730,81 +731,6 @@ function groupOrdersByPickup(orders) {
   return [...groups.values()].sort((a, b) => a.key.localeCompare(b.key));
 }
 
-function renderOrdersPage(groups, { total, umsatz, filterTag }) {
-  const heute = new Date().toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" });
-
-  const gruppenHtml = groups
-    .map((g) => {
-      const zeilen = g.orders
-        .map((o) => {
-          const artikel = (o.items || [])
-            .map((it) => `${esc(it.name)} <b>×${esc(it.qty)}</b>`)
-            .join("<br>");
-          const tel = o.customerPhone
-            ? `<a href="tel:${esc(o.customerPhone.replace(/\s/g, ""))}">${esc(o.customerPhone)}</a>`
-            : '<span class="muted">keine Nummer</span>';
-          return `<div class="order">
-            <div class="order-head">
-              <span class="resnr">${esc(o.reservationNumber || "—")}</span>
-              <span class="sum">${euro(o.total)}</span>
-            </div>
-            <div class="name">${esc(o.customerName)}</div>
-            <div class="contact">${tel} · <a href="mailto:${esc(o.customerEmail)}">${esc(o.customerEmail)}</a></div>
-            <div class="items">${artikel || '<span class="muted">keine Artikel</span>'}</div>
-          </div>`;
-        })
-        .join("");
-
-      const gsum = g.orders.reduce((s, o) => s + Number(o.total || 0), 0);
-      return `<section class="day">
-        <h2>${esc(g.label)}</h2>
-        <p class="daymeta">${g.orders.length} ${g.orders.length === 1 ? "Reservierung" : "Reservierungen"} · ${euro(gsum)}</p>
-        ${zeilen}
-      </section>`;
-    })
-    .join("");
-
-  return `<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
-<title>Reservierungen — Feuerwerk Lindner</title>
-<style>
-  * { box-sizing: border-box; }
-  body { margin:0; padding:16px; background:#28418c; color:#eef1fb;
-         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:16px; }
-  h1 { font-size:21px; margin:0 0 2px; }
-  .meta { color:#cdd3f2; font-size:14px; margin-bottom:20px; }
-  .day { margin-bottom:26px; }
-  .day h2 { font-size:17px; margin:0 0 2px; color:#72f2bf; }
-  .daymeta { margin:0 0 10px; font-size:13px; color:#cdd3f2; }
-  .order { background:#3655a6; border:1px solid rgba(255,255,255,0.16);
-           border-radius:12px; padding:13px 15px; margin-bottom:9px; }
-  .order-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
-  .resnr { font-size:12px; letter-spacing:1px; color:#ffd23d; font-weight:700; }
-  .sum { font-weight:700; color:#ff6fc4; }
-  .name { font-size:18px; font-weight:600; margin:3px 0 2px; }
-  .contact { font-size:14px; margin-bottom:8px; }
-  .items { font-size:14px; line-height:1.6; color:#cdd3f2;
-           border-top:1px solid rgba(255,255,255,0.13); padding-top:8px; }
-  .muted { color:#9aa0b4; }
-  a { color:#6adfff; }
-  .empty { background:#3655a6; border-radius:12px; padding:22px; text-align:center; color:#cdd3f2; }
-</style>
-</head>
-<body>
-  <h1>Reservierungen</h1>
-  <p class="meta">
-    Stand ${esc(heute)} · ${total} ${total === 1 ? "Reservierung" : "Reservierungen"} · ${euro(umsatz)} gesamt
-    ${filterTag ? `<br>Gefiltert auf ${esc(filterTag)}` : ""}
-  </p>
-  ${gruppenHtml || '<div class="empty">Noch keine Reservierungen.</div>'}
-</body>
-</html>`;
-}
-
 // ---------------------------------------------------------------------------
 // Tagesübersicht am Vorabend
 //
@@ -1239,6 +1165,29 @@ async function handleAdminOrderStatus(req, res, url) {
   }
 }
 
+async function handleAdminOrderPacked(req, res, url) {
+  const auth = adminAuthorized(req, url, { bearerOnly: true });
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+  if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers["content-type"] || ""))) {
+    return sendJson(res, 415, { ok: false, error: "unsupported_media_type" });
+  }
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).some(key => !["id", "packed", "expectedVersion"].includes(key))
+    || typeof body.id !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(body.id)
+    || typeof body.packed !== "boolean" || !Number.isSafeInteger(body.expectedVersion) || body.expectedVersion < 0) {
+    return sendJson(res, 400, { ok: false, error: "invalid_packing_request" });
+  }
+  const result = await store.setOrderPacked(body);
+  if (!result.ok) {
+    const { reason, ...current } = result;
+    return sendJson(res, reason === "order_not_found" ? 404 : 409, { ...current, error: reason });
+  }
+  return sendJson(res, 200, result);
+}
+
 async function handleAdminCancelReservation(req, res, url) {
   const auth = adminAuthorized(req, url);
   if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
@@ -1385,6 +1334,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/admin/order-status") {
       return await handleAdminOrderStatus(req, res, url);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/order-packed") {
+      return await handleAdminOrderPacked(req, res, url);
     }
 
     if (req.method === "POST" && url.pathname === "/api/admin/cancel-reservation") {

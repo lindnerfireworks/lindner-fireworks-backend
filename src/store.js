@@ -678,6 +678,47 @@ async function setOrderStatus(id, status, when = new Date()) {
   }));
 }
 
+function packingState(order) {
+  return {
+    id: order.id,
+    packed: order.packed === true,
+    packedAt: order.packed === true ? order.packedAt || null : null,
+    packingUpdatedAt: order.packingUpdatedAt || null,
+    packingVersion: Number.isSafeInteger(order.packingVersion) && order.packingVersion >= 0 ? order.packingVersion : 0,
+  };
+}
+
+async function setOrderPacked({ id, packed, expectedVersion, when = new Date() } = {}) {
+  if (typeof id !== "string" || typeof packed !== "boolean"
+    || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0
+    || !(when instanceof Date) || Number.isNaN(when.valueOf())) throw new Error("invalid_packing_request");
+  return runExclusive(() => withStorageLock(async () => {
+    await recoverPendingLocked();
+    // Read inside the shared lock; status changes and cancellation cannot be
+    // overwritten with a stale copy of the order list.
+    const orders = await readJson(ORDERS_FILE, []);
+    const order = orders.find(entry => entry.id === id);
+    if (!order) return { ok: false, reason: "order_not_found" };
+    const current = packingState(order);
+    if (["cancelled", "purchased", "collected", "fulfilled", "completed", "picked_up"].includes(order.status)
+      || order.cancelledAt || order.stockRelease || order.purchaseCompletedAt || hasFulfilmentEvidence(order)) {
+      return { ok: false, reason: "order_not_packable", ...current };
+    }
+    // Setting the same state is harmless, including after a lost response.
+    if (current.packed === packed) return { ok: true, ...current };
+    if (current.packingVersion !== expectedVersion || current.packingVersion === Number.MAX_SAFE_INTEGER) {
+      return { ok: false, reason: "packing_conflict", ...current };
+    }
+    const timestamp = when.toISOString();
+    Object.assign(order, { packed, packedAt: packed ? timestamp : null,
+      packingUpdatedAt: timestamp, packingVersion: current.packingVersion + 1 });
+    // Only the four packing fields on this order change. No inventory,
+    // customer email, reservation status, pickup time or counter is touched.
+    await writeJson(ORDERS_FILE, orders);
+    return { ok: true, ...packingState(order) };
+  }));
+}
+
 module.exports = {
   DATA_DIR,
   initialize,
@@ -702,4 +743,6 @@ module.exports = {
   privacyCleanup,
   cancelReservation,
   setOrderStatus,
+  setOrderPacked,
+  packingState,
 };
