@@ -32,25 +32,25 @@ const {
 } = require("./email");
 const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
+const { pickupOptions, PICKUP_FIRST_DAY, TIME_ZONE, calendarDate, viennaDateOnly } = require("./pickup");
 
 const PORT = process.env.PORT || 4000;
 
 // ---------------------------------------------------------------------------
 // Verkaufsfenster
 //
-// Vor diesem Datum nimmt der Shop KEINE Reservierungen an. Die Artikel bleiben
-// sichtbar und der Warenkorb lässt sich befüllen – nur das Absenden wird
-// blockiert, im Browser (Button gesperrt) UND hier serverseitig, damit es sich
-// nicht über die Entwicklerkonsole umgehen lässt.
+// Reservierungen sind standardmäßig sofort offen. Der Abholbeginn ist davon
+// getrennt im Abholkalender geregelt. Eine explizite ORDERS_OPEN_FROM-Sperre
+// bleibt für den Betrieb möglich; zur Vorbestellöffnung muss sie leer sein.
 //
 // Umstellen ohne Code-Änderung über die Umgebungsvariable ORDERS_OPEN_FROM
 // (Format JJJJ-MM-TT, Ortszeit Österreich). Beispiele:
-//   ORDERS_OPEN_FROM=2026-11-01   -> ab 1. Dezember 2026, 00:00 Uhr
+//   ORDERS_OPEN_FROM=2026-11-01   -> ab 1. November 2026, 00:00 Uhr
 //   ORDERS_OPEN_FROM=              -> sofort offen (leerer Wert = keine Sperre)
 // Optional lässt sich mit ORDERS_OPEN_UNTIL auch ein Ende setzen, z.B. nach
 // Silvester: ORDERS_OPEN_UNTIL=2027-01-01
 // ---------------------------------------------------------------------------
-const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "2026-11-01").trim();
+const ORDERS_OPEN_FROM = (process.env.ORDERS_OPEN_FROM ?? "").trim();
 const ORDERS_OPEN_UNTIL = (process.env.ORDERS_OPEN_UNTIL ?? "2027-01-01").trim();
 const ORDER_TEST_KEY = (process.env.ORDER_TEST_KEY || "").trim();
 const ORDER_TEST_EMAIL = (process.env.ORDER_TEST_EMAIL || "").trim().toLowerCase();
@@ -62,14 +62,18 @@ const ORDER_TEST_UNTIL = (process.env.ORDER_TEST_UNTIL || "").trim();
 
 /**
  * Wandelt "2026-11-01" in einen Zeitpunkt um, der Mitternacht österreichischer
- * Zeit entspricht. Im Dezember gilt MEZ (UTC+1), deshalb wird eine Stunde
- * abgezogen. Bei ungültiger Eingabe wird null geliefert (= keine Sperre), damit
- * ein Tippfehler in der Variable nie den ganzen Shop lahmlegt.
+ * Zeit entspricht, mit dem jeweiligen Sommer-/Winterzeitoffset. Ungültige
+ * Kalenderdaten liefern null und führen in shopStatus zu einer Sperre.
  */
 function parseViennaDate(value) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
-  const ms = Date.parse(`${value}T00:00:00+01:00`);
-  return Number.isNaN(ms) ? null : ms;
+  if (!calendarDate(value)) return null;
+  // Derive the UTC offset for Austrian midnight, including summer time.
+  const utcMidnight = Date.parse(`${value}T00:00:00Z`);
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: TIME_ZONE,
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(utcMidnight));
+  const hours = Number(parts.find(part => part.type === "hour").value);
+  const minutes = Number(parts.find(part => part.type === "minute").value);
+  return utcMidnight - (hours * 60 + minutes) * 60000;
 }
 
 /** Ist der Shop gerade für Reservierungen offen? */
@@ -281,11 +285,6 @@ async function handleGetProducts(req, res) {
   sendJson(res, 200, products.filter((product) => getProduct(product.id)));
 }
 
-function pickupDateFromText(value) {
-  const match = String(value || "").match(/(\d{2})\.(\d{2})\.(\d{4})/);
-  return match ? `${match[3]}-${match[2]}-${match[1]}` : null;
-}
-
 async function dispatchReservationEmails(order) {
   order = await store.getOrderById(order.id) || order;
   let emails = {
@@ -375,7 +374,7 @@ async function dispatchReservationEmails(order) {
 // Preis und Artikelname werden bewusst NICHT vom Frontend übernommen, sondern
 // serverseitig aus src/catalog.js nachgeschlagen. Alles andere ließe sich über
 // die Entwicklertools des Browsers manipulieren.
-async function handlePostOrder(req, res, { testMode = false } = {}) {
+async function handlePostOrder(req, res, { testMode = false, receivedAt = new Date() } = {}) {
   let body;
   try {
     body = await readJsonBody(req);
@@ -389,7 +388,9 @@ async function handlePostOrder(req, res, { testMode = false } = {}) {
   if (typeof requestId !== "string" || !/^[a-f0-9-]{36}$/i.test(requestId)) {
     return sendJson(res, 400, { ok: false, error: "invalid_request_id" });
   }
-  const requestHash = crypto.createHash("sha256").update(JSON.stringify({customerName, customerEmail, customerPhone, rawItems, ageConfirmed})).digest("hex");
+  const hashPayload = {customerName, customerEmail, customerPhone, rawItems, ageConfirmed};
+  if (Object.prototype.hasOwnProperty.call(body, "pickupDate")) hashPayload.pickupDate = body.pickupDate;
+  const requestHash = crypto.createHash("sha256").update(JSON.stringify(hashPayload)).digest("hex");
   if (!emailServiceReady({ requirePickup: true })) {
     return sendJson(res, 503, {ok: false, error: "service_not_ready"});
   }
@@ -459,9 +460,20 @@ async function handlePostOrder(req, res, { testMode = false } = {}) {
 
   // Bestand, Reservierung und Nummernzaehler werden gemeinsam ueber ein
   // wiederanlaufbares Journal gespeichert. Erst danach beginnt der Mailversand.
-  const abholtermin = computeAbholzeit();
+  // A retry uses the original stored appointment, even after a later cutoff.
+  const previousOrder = (await store.getOrders()).find(order => order.requestId === requestId);
+  if (previousOrder && previousOrder.requestHash !== requestHash) {
+    return sendJson(res, 409, { ok: false, error: "request_conflict" });
+  }
+  const options = previousOrder ? [] : pickupOptions(receivedAt);
+  const selected = body.pickupDate === undefined ? options[0] : options.find(option => option.date === body.pickupDate);
+  if (!previousOrder && !selected) {
+    return sendJson(res, 400, { ok: false,
+      error: body.pickupDate !== undefined ? "invalid_pickup_date" : "no_pickup_available" });
+  }
+  const abholtermin = previousOrder ? previousOrder.abholtermin : selected.label;
   const total = Math.round(items.reduce((sum, it) => sum + it.price * it.qty, 0) * 100) / 100;
-  const createdAt = new Date();
+  const createdAt = receivedAt;
   const transaction = await store.createReservation({
     requestId,
     requestHash,
@@ -477,7 +489,8 @@ async function handlePostOrder(req, res, { testMode = false } = {}) {
     items,
     total,
     abholtermin,
-    pickupDate: pickupDateFromText(abholtermin),
+    pickupDate: previousOrder ? previousOrder.pickupDate : selected.date,
+    pickupTimeWindow: previousOrder ? previousOrder.pickupTimeWindow : selected.timeWindow,
     reservationDate: createdAt.toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" }),
     testMode: testMode === true,
     },
@@ -1278,6 +1291,7 @@ async function handleAdminCancelReservation(req, res, url) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const receivedAt = new Date();
   setCorsHeaders(req, res);
 
   if (req.method === "OPTIONS") {
@@ -1296,10 +1310,17 @@ const server = http.createServer(async (req, res) => {
       return await handleGetProducts(req, res);
     }
 
+    if (req.method === "GET" && url.pathname === "/api/pickup-options") {
+      const status = shopStatus(receivedAt.valueOf());
+      return sendJson(res, 200, { ok: true, serverTime: receivedAt.toISOString(),
+        timeZone: TIME_ZONE, ...status, firstPickupDay: PICKUP_FIRST_DAY,
+        regularCutoff: "Mittwoch Tagesende (Europe/Vienna)", options: pickupOptions(receivedAt) });
+    }
+
     // Die Website fragt hier ab, ob der Shop schon Reservierungen annimmt,
     // und blendet danach den Hinweis ein bzw. sperrt den Absende-Button.
     if (req.method === "GET" && url.pathname === "/api/shop-status") {
-      const status = shopStatus();
+      const status = shopStatus(receivedAt.valueOf());
       if (!status.open && testAccessAuthorized(req)) {
         return sendJson(res, 200, { ok: true, open: true, testMode: true, publicStatus: status });
       }
@@ -1308,7 +1329,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/order") {
       // Verkaufsfenster prüfen, BEVOR irgendetwas abgebucht oder gemailt wird.
-      const status = shopStatus();
+      const status = shopStatus(receivedAt.valueOf());
       const testMode = !status.open && testAccessAuthorized(req);
       if (!status.open && !testMode) {
         return sendJson(res, 403, { ok: false, error: "shop_closed", ...status });
@@ -1318,7 +1339,7 @@ const server = http.createServer(async (req, res) => {
       if (!rateLimitOk(req, "order", 5, 60 * 60 * 1000)) {
         return sendJson(res, 429, { ok: false, error: "rate_limited" });
       }
-      return await queueOrder(req, res, { testMode });
+      return await queueOrder(req, res, { testMode, receivedAt });
     }
 
     if (req.method === "POST" && url.pathname === "/api/contact") {

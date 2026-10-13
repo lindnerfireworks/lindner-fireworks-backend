@@ -147,9 +147,17 @@ async function initialize() {
   await removeFile(LOCK_FILE);
   return runExclusive(() => withStorageLock(async () => {
     const journal = await readJson(TRANSACTION_FILE, null);
-    if (!journal) return { recovered: false };
-    await applyJournal(journal);
-    return { recovered: true, transactionId: journal.transactionId || null };
+    if (journal) await applyJournal(journal);
+    // Add once after recovery, under the same storage lock. Existing entries
+    // (including stock zero after reservations) are never reset by a deploy.
+    const products = await readJson(PRODUCTS_FILE, []);
+    let productAdded = false;
+    if (!products.some(product => product.id === "shaolin-6")) {
+      products.push({ id: "shaolin-6", name: "Shaolin 6", stock: 3 });
+      await writeJson(PRODUCTS_FILE, products);
+      productAdded = true;
+    }
+    return { recovered: Boolean(journal), transactionId: journal?.transactionId || null, productAdded };
   }));
 }
 

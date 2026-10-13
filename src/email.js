@@ -88,102 +88,10 @@ function itemsListText(items) {
     .join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Abholtermine
-//
-// Regulär: Freitag 13:00-16:00 und Samstag 09:00-12:00.
-// Endspurt 27.-31.12.: täglich 08:00-12:00.
-// Gesperrt: 24., 25. und 26. Dezember (Feiertage).
-// Nach dem letzten Abholtag (31.12.) gibt es keinen Termin mehr - dann liefert
-// computeAbholzeit() null und Kunde wie Betreiber sehen "Termin telefonisch".
-//
-// Vorlauf: LEAD_DAYS Tage zum Abpacken. Bei 5 Tagen (dem alten Wert) wäre ab
-// dem 26.12. kein Termin mehr möglich gewesen - genau in der umsatzstärksten
-// Woche. Deshalb 2 Tage.
-//
-// Alles über Umgebungsvariablen anpassbar, ohne Code zu ändern:
-//   ORDER_LEAD_DAYS   Vorlauf in Tagen (Standard 2)
-//   PICKUP_LAST_DAY   letzter Abholtag (Standard 2026-12-31)
-//   PICKUP_DAILY_FROM / PICKUP_DAILY_UNTIL  Zeitraum mit täglicher Abholung
-//   PICKUP_CLOSED     gesperrte Tage, kommagetrennt
-// ---------------------------------------------------------------------------
-const LEAD_DAYS = Number(process.env.ORDER_LEAD_DAYS || 2);
-const PICKUP_FIRST_DAY = process.env.PICKUP_FIRST_DAY || "2026-11-01";
-const PICKUP_LAST_DAY = process.env.PICKUP_LAST_DAY || "2026-12-31";
-const PICKUP_DAILY_FROM = process.env.PICKUP_DAILY_FROM || "2026-12-27";
-const PICKUP_DAILY_UNTIL = process.env.PICKUP_DAILY_UNTIL || "2026-12-31";
-const PICKUP_CLOSED = (process.env.PICKUP_CLOSED || "2026-12-24,2026-12-25,2026-12-26")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const SLOT_FRIDAY = "13:00–16:00 Uhr";
-const SLOT_SATURDAY = "09:00–12:00 Uhr";
-const SLOT_DAILY = "08:00–12:00 Uhr";
-
-/**
- * Heutiges Datum in österreichischer Zeit, als Date auf 12:00 UTC gesetzt.
- * Der Server läuft in UTC; ohne diese Umrechnung würde eine Bestellung um
- * 00:30 Uhr österreichischer Zeit noch als Vortag gerechnet. Mittag als
- * Uhrzeit, damit Sommer-/Winterzeit das Datum nie kippen kann.
- */
-function viennaDateOnly(now = new Date()) {
-  const iso = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Vienna",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-  return new Date(`${iso}T12:00:00Z`);
-}
-
-function isoDay(d) {
-  return d.toISOString().slice(0, 10);
-}
-
-/** Zeitfenster für diesen Tag, oder null wenn an dem Tag nicht abgeholt wird. */
-function slotForDay(d) {
-  const iso = isoDay(d);
-  if (iso < PICKUP_FIRST_DAY || iso > PICKUP_LAST_DAY) return null; // Saison vorbei
-  if (PICKUP_CLOSED.includes(iso)) return null;
-  if (iso >= PICKUP_DAILY_FROM && iso <= PICKUP_DAILY_UNTIL) return SLOT_DAILY;
-  const dow = d.getUTCDay(); // 5 = Freitag, 6 = Samstag
-  if (dow === 5) return SLOT_FRIDAY;
-  if (dow === 6) return SLOT_SATURDAY;
-  return null;
-}
-
-function formatGermanDate(d) {
-  return d.toLocaleDateString("de-AT", {
-    weekday: "long",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    timeZone: "UTC",
-  });
-}
-
-/**
- * Nächster möglicher Abholtermin als Text, oder null wenn die Saison vorbei
- * ist bzw. der Vorlauf nicht mehr reicht.
- */
-function computeAbholzeit(now = new Date()) {
-  const d = viennaDateOnly(now);
-  d.setUTCDate(d.getUTCDate() + LEAD_DAYS);
-
-  const last = new Date(`${PICKUP_LAST_DAY}T12:00:00Z`);
-  while (d <= last) {
-    const slot = slotForDay(d);
-    if (slot) return `${formatGermanDate(d)}, ${slot}`;
-    d.setUTCDate(d.getUTCDate() + 1);
-  }
-  return null;
-}
-
-/** Für Anzeigezwecke: nie leer, sondern ein sprechender Ersatztext. */
-function abholzeitText(value) {
-  return value || "Wir vereinbaren den Termin mit dir per E-Mail";
-}
+// Shared calendar; mail templates only render the appointment stored on the order.
+const { LEAD_DAYS, PICKUP_FIRST_DAY, PICKUP_LAST_DAY, PICKUP_DAILY_FROM,
+  PICKUP_DAILY_UNTIL, PICKUP_CLOSED, computeAbholzeit, abholzeitText, slotForDay,
+  viennaDateOnly, isoDay, formatGermanDate } = require("./pickup");
 
 // ---------------------------------------------------------------------------
 // Layout-Bausteine
@@ -380,7 +288,7 @@ async function sendCustomerConfirmation({
   abholscheinPdf,
   idempotencyKey,
 }) {
-  const termin = abholzeitText(abholtermin || computeAbholzeit());
+  const termin = abholzeitText(abholtermin);
   const subject = "Deine Reservierung bei Feuerwerk Lindner – Bestätigung";
 
   const rechnungHinweis = abholscheinPdf
@@ -479,7 +387,7 @@ async function sendOwnerNotification({
   idempotencyKey,
 }) {
   const ownerEmail = process.env.OWNER_EMAIL || "[LUKAS E-MAIL HIER EINTRAGEN]";
-  const termin = abholzeitText(abholtermin || computeAbholzeit());
+  const termin = abholzeitText(abholtermin);
   const zeitpunkt = new Date(occurredAt || 0).toLocaleString("de-AT", { timeZone: "Europe/Vienna" });
   const subject = `Neue Reservierung – ${customerName}`;
   const customerStatusHtml = "Die Kundenbestätigung wird separat verarbeitet. Der E-Mail-Dienststatus und die tatsächliche Zustellung sind getrennt zu prüfen.";

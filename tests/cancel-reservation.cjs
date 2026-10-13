@@ -374,9 +374,11 @@ async function withServer(dataDir, fn, overrides = {}) {
       products: [{ id: "rocket", stock: 8 }],
       orders: [order],
     });
-    const beforeProducts = fs.readFileSync(path.join(dataDir, "products.json"), "utf8");
-    const beforeOrders = fs.readFileSync(path.join(dataDir, "orders.json"), "utf8");
     await withServer(dataDir, async (run) => {
+      // Compare the cancellation against its live baseline after startup's
+      // additive product migration, which has its own isolated coverage.
+      const beforeProducts = fs.readFileSync(path.join(dataDir, "products.json"), "utf8");
+      const beforeOrders = fs.readFileSync(path.join(dataDir, "orders.json"), "utf8");
       const result = await post(run, "/api/admin/cancel-reservation", {
         id: order.id,
         apply: true,
