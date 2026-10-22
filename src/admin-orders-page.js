@@ -37,7 +37,6 @@ function packingTime(value) {
 
 // Static client source: no customer data or server credential is embedded here.
 function packingClient() {
-  const key = new URLSearchParams(window.location.search).get("key") || "";
   const rows = document.querySelectorAll(".order");
   const formatTime = value => {
     if (!value) return "—";
@@ -65,19 +64,14 @@ function packingClient() {
       changedAt.textContent = formatTime(data.packingUpdatedAt);
     };
 
-    if (!key && input.dataset.packable === "true") {
-      input.disabled = true;
-      announce("Adminlink mit Schlüssel öffnen", "error");
-    }
-
-    input.disabled = input.dataset.packable !== "true" || !key;
+    input.disabled = input.dataset.packable !== "true";
 
     input.addEventListener("change", async () => {
       const previous = input.dataset.confirmedPacked === "true";
       const desired = input.checked;
       const restoreFocus = document.activeElement === input;
       input.checked = previous;
-      if (row.dataset.saving === "true" || input.dataset.packable !== "true" || !key) return;
+      if (row.dataset.saving === "true" || input.dataset.packable !== "true") return;
       row.dataset.saving = "true";
       input.disabled = true;
       details.inert = true;
@@ -88,7 +82,7 @@ function packingClient() {
       try {
         const response = await fetch("/api/admin/order-packed", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+          headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
           referrerPolicy: "no-referrer",
           signal: controller.signal,
@@ -108,7 +102,7 @@ function packingClient() {
         } else {
           input.checked = previous;
           announce(response.status === 401 || response.status === 403
-            ? "Nicht gespeichert. Bitte den gültigen Adminlink öffnen."
+            ? "Nicht gespeichert. Bitte erneut anmelden."
             : "Speicherung nicht bestätigt. Zuletzt bestätigter Stand angezeigt; bitte neu laden.", "error");
         }
       } catch {
@@ -119,7 +113,7 @@ function packingClient() {
         row.dataset.saving = "false";
         details.inert = false;
         details.removeAttribute("aria-busy");
-        input.disabled = input.dataset.packable !== "true" || !key;
+        input.disabled = input.dataset.packable !== "true";
         if (restoreFocus && !input.disabled && document.activeElement === document.body) input.focus({ preventScroll: true });
       }
     });
@@ -213,6 +207,7 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
 <body>
 <main>
   <h1>Reservierungen</h1>
+  <form method="post" action="/api/admin/logout"><button type="submit">Abmelden</button></form>
   <p class="meta">Stand ${esc(heute)} · ${esc(total)} ${total === 1 ? "Reservierung" : "Reservierungen"} · ${euro(umsatz)} gesamt${filterTag ? `<br>Gefiltert auf ${esc(filterTag)}` : ""}</p>
   ${gruppenHtml || '<div class="empty">Noch keine Reservierungen.</div>'}
 </main>

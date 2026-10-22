@@ -112,8 +112,10 @@ async function postWithoutAuth(run, route, body) {
 }
 
 async function adjustStock(run, id, delta) {
-  const response = await fetch(`${run.base}/api/admin/adjust-stock?id=${encodeURIComponent(id)}&delta=${delta}`, {
-    headers: { Authorization: "Bearer isolated-cancel-key" },
+  const response = await fetch(`${run.base}/api/admin/adjust-stock`, {
+    method: "POST",
+    headers: { Authorization: "Bearer isolated-cancel-key", "Content-Type": "application/json" },
+    body: JSON.stringify({ id, delta }),
   });
   return { status: response.status, data: await response.json() };
 }

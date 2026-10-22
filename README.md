@@ -62,7 +62,7 @@ Die neuen Admin-Endpunkte erwarten `Authorization: Bearer …`; der ältere Quer
 - `POST /api/admin/privacy-cleanup`: Vorschau standardmäßig; Ausführung nur mit der exakten Bestätigung `APPLY-PRIVACY-CLEANUP`.
 - `POST /api/admin/order-status`: Statusverwaltung für weiterhin aktive Vorgänge; ein Storno ist hier gesperrt und kann eine stornierte Reservierung nicht reaktivieren.
 - `POST /api/admin/cancel-reservation`: zunächst strikt lesende Vorschau per UUID oder Reservierungsnummer, danach bestätigte atomare Stornierung mit einmaliger Bestandsrückbuchung. Vollständiger Vertrag: [CANCELLATION-API.md](CANCELLATION-API.md).
-- `GET /api/admin/adjust-stock`: unabhängige manuelle Bestandskorrektur; nicht für Reservierungsstornos verwenden.
+- `POST /api/admin/adjust-stock`: unabhängige manuelle Bestandskorrektur mit `Authorization: Bearer …`, `Content-Type: application/json` und JSON `{ "id": "artikel-id", "delta": 1 }`; nicht für Reservierungsstornos verwenden. GET verändert keinen Bestand.
 
 Reservierungen ohne Kauf werden spätestens zwölf Monate nach Abholtermin oder Absage zur Löschung vorgeschlagen. Gekaufte Vorgänge bleiben bis zum 1. Jänner nach sieben vollständigen Kalenderjahren erhalten. Die Bereinigung läuft nicht automatisch im Server; sie muss regelmäßig erst als Dry-Run geprüft und anschließend bewusst ausgelöst werden.
 

@@ -1,5 +1,5 @@
 // Bewusst OHNE Express/Framework gebaut, nur mit Node.js-Bordmitteln
-// (Node 20.6+/22 kann alles Nötige schon selbst: eingebauter http-Server,
+// (Node 24.22.1 kann alles Nötige schon selbst: eingebauter http-Server,
 // eingebautes fetch() für Resend, eingebautes process.loadEnvFile() statt
 // dem "dotenv"-Paket). Vorteil: kein "npm install" nötig, nichts, was beim
 // Hosting-Anbieter mal fehlschlagen oder veralten kann – einfach `node
@@ -34,6 +34,7 @@ const { generateReservationPdf } = require("./invoice");
 const { getProduct } = require("./catalog");
 const { pickupOptions, PICKUP_FIRST_DAY, TIME_ZONE, calendarDate, viennaDateOnly } = require("./pickup");
 const { renderOrdersPage } = require("./admin-orders-page");
+const adminAuth = require("./admin-auth");
 
 const PORT = process.env.PORT || 4000;
 
@@ -135,6 +136,8 @@ function setCorsHeaders(req, res) {
 const rateBuckets = new Map();
 
 function clientIp(req) {
+  // This relies on the deployment's HTTP ingress sanitizing X-Forwarded-For.
+  // Do not expose this server through a direct TCP proxy.
   const fwd = req.headers["x-forwarded-for"];
   if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
   return req.socket.remoteAddress || "unbekannt";
@@ -147,6 +150,7 @@ function rateLimitOk(req, bucket, maxRequests, windowMs) {
   const entry = rateBuckets.get(key);
 
   if (!entry || now > entry.resetAt) {
+    if (!entry && rateBuckets.size >= 5000) return false;
     rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
     return true;
   }
@@ -169,16 +173,37 @@ function sendJson(res, statusCode, data) {
   res.end(body);
 }
 
-function adminAuthorized(req, url, { bearerOnly = false } = {}) {
-  const adminKey = process.env.ADMIN_KEY;
-  if (!adminKey) return { ok: false, status: 503, error: "admin_disabled" };
-  const authorization = String(req.headers.authorization || "");
-  const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  const supplied = bearer || (!bearerOnly && url.searchParams.get("key")) || "";
-  const expected = Buffer.from(adminKey);
-  const actual = Buffer.from(supplied);
-  const matches = expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
-  return matches ? { ok: true } : { ok: false, status: 401, error: "unauthorized" };
+function adminAuthorized(req) {
+  // The URL never supplies credentials. Browser sessions and explicit Bearer
+  // credentials are both supported; sessions require same-origin mutations.
+  return adminAuth.authorize(req);
+}
+
+function adminHtml(res, html) {
+  const hashes = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map(match => "'sha256-" + crypto.createHash("sha256").update(match[1]).digest("base64") + "'");
+  res.setHeader("Content-Security-Policy", `default-src 'none'; script-src ${hashes.join(" ") || "'none'"}; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`);
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow" });
+  res.end(html);
+}
+
+async function handleAdminLogin(req, res, url) {
+  if (req.method === "GET") return adminHtml(res, adminAuth.loginPage(url.searchParams.get("next")));
+  if (!adminAuth.sameOrigin(req)) return sendJson(res, 403, { ok: false, error: "origin_forbidden" });
+  if (!rateLimitOk(req, "admin-login", 10, 15 * 60 * 1000)) return sendJson(res, 429, { ok: false, error: "rate_limited" });
+  if (!/^application\/x-www-form-urlencoded(?:\s*;|$)/i.test(String(req.headers["content-type"] || ""))) {
+    return sendJson(res, 415, { ok: false, error: "unsupported_media_type" });
+  }
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (Buffer.byteLength(body) > 4096) return sendJson(res, 413, { ok: false, error: "payload_too_large" });
+  }
+  const fields = new URLSearchParams(body);
+  const keys = fields.getAll("key");
+  if (keys.length !== 1 || !adminAuth.issueSession(req, res, keys[0])) return sendJson(res, 401, { ok: false, error: "unauthorized" });
+  res.writeHead(303, { Location: adminAuth.safeNext(fields.get("next")), "Cache-Control": "no-store" });
+  res.end();
 }
 
 function testAccessAuthorized(req) {
@@ -545,6 +570,13 @@ async function handlePostOrder(req, res, { testMode = false, receivedAt = new Da
 // Bestellungs-ID). Wird aus der internen Besitzer-Benachrichtigung heraus
 // verlinkt, damit Lukas sie zu Hause direkt öffnen/ausdrucken kann.
 async function handleGetAbholschein(req, res, orderId) {
+  const auth = adminAuthorized(req);
+  if (!auth.ok && auth.status === 401 && !req.headers.authorization) {
+    const next = adminAuth.safeNext(`/api/abholschein/${orderId}`);
+    res.writeHead(303, { Location: "/api/admin/login?next=" + encodeURIComponent(next), "Cache-Control": "no-store" });
+    return res.end();
+  }
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
   const order = await store.getOrderById(orderId);
   if (!order) {
     return sendJson(res, 404, { ok: false, error: "not_found" });
@@ -681,15 +713,14 @@ function queueInquiry(handler, req, res) {
 }
 
 // ---------- Admin: manuelle Bestandskorrektur (z.B. bei Stornierung) ----------
-// Nur per GET aufrufbar (bewusst so gebaut, damit Claude das direkt selbst
-// aufrufen kann, ohne dass du erst wieder Dateien hochladen musst) und nur
+// Nur per JSON-POST aufrufbar und nur
 // mit dem geheimen ADMIN_KEY (als Umgebungsvariable in Railway gesetzt, nicht
 // im Code). Ohne gesetzten ADMIN_KEY ist dieser Endpunkt komplett deaktiviert.
 // ---------------------------------------------------------------------------
 // Reservierungsübersicht fürs Handy
 //
-// Aufruf mit dem bestehenden ADMIN_KEY, z.B. als Lesezeichen am Handy:
-//   /api/admin/orders?key=DEINSCHLUESSEL
+// Im Browser /api/admin/orders öffnen und mit dem ADMIN_KEY anmelden.
+// Automationen verwenden Authorization: Bearer; kein Schlüssel in URLs.
 //
 // Zeigt alle Reservierungen nach Abholtag gruppiert, mit Name, Telefon,
 // Artikeln und Summe. Bewusst als fertige HTML-Seite statt JSON, damit sie
@@ -848,10 +879,9 @@ async function runDailyDigest({ now = new Date(), force = false } = {}) {
     return { skipped: "keine_abholungen", morgenIso };
   }
 
-  const adminKey = process.env.ADMIN_KEY;
   const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
   const adminUrl =
-    base && adminKey ? `${base}/api/admin/orders?key=${encodeURIComponent(adminKey)}&tag=${morgenIso}` : null;
+    base ? `${base}/api/admin/orders?tag=${morgenIso}` : null;
 
   const result = await sendDailyDigest({
     datumLabel: formatGermanDate(morgen),
@@ -987,7 +1017,7 @@ function renderStatsPage(liste, { tageZurueck }) {
   const filter = [
     ["7", "7 Tage"], ["30", "30 Tage"], ["", "Gesamt"],
   ].map(([w, t]) =>
-    `<a href="?key=${encodeURIComponent(process.env.ADMIN_KEY || "")}${w ? "&tage=" + w : ""}"
+    `<a href="?${w ? "tage=" + w : ""}"
         class="${String(tageZurueck || "") === w ? "an" : ""}">${t}</a>`).join("");
 
   return `<!DOCTYPE html>
@@ -1061,12 +1091,7 @@ async function handleAdminStats(req, res, url) {
     return sendJson(res, 200, { ok: true, tageZurueck, artikel: liste });
   }
 
-  res.writeHead(200, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
-    "X-Robots-Tag": "noindex, nofollow",
-  });
-  res.end(renderStatsPage(liste, { tageZurueck }));
+  adminHtml(res, renderStatsPage(liste, { tageZurueck }));
 }
 
 async function handleAdminOrders(req, res, url) {
@@ -1088,21 +1113,22 @@ async function handleAdminOrders(req, res, url) {
   const umsatz = orders.reduce((s, o) => s + Number(o.total || 0), 0);
   const html = renderOrdersPage(groups, { total: orders.length, umsatz, filterTag });
 
-  res.writeHead(200, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
-    "X-Robots-Tag": "noindex, nofollow",
-  });
-  res.end(html);
+  adminHtml(res, html);
 }
 
 async function handleAdminAdjustStock(req, res, url) {
   const auth = adminAuthorized(req, url);
   if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
 
-  const id = url.searchParams.get("id");
-  const delta = parseInt(url.searchParams.get("delta"), 10);
-  if (!id || Number.isNaN(delta) || delta === 0) {
+  if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers["content-type"] || ""))) {
+    return sendJson(res, 415, { ok: false, error: "unsupported_media_type" });
+  }
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return sendJson(res, 400, { ok: false, error: "invalid_json" }); }
+  const id = body?.id;
+  const delta = body?.delta;
+  if (typeof id !== "string" || !id || !Number.isSafeInteger(delta) || delta === 0) {
     return sendJson(res, 400, { ok: false, error: "invalid_request" });
   }
 
@@ -1166,7 +1192,7 @@ async function handleAdminOrderStatus(req, res, url) {
 }
 
 async function handleAdminOrderPacked(req, res, url) {
-  const auth = adminAuthorized(req, url, { bearerOnly: true });
+  const auth = adminAuthorized(req);
   if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
   if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers["content-type"] || ""))) {
     return sendJson(res, 415, { ok: false, error: "unsupported_media_type" });
@@ -1241,6 +1267,10 @@ async function handleAdminCancelReservation(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const receivedAt = new Date();
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  if (process.env.RAILWAY_SERVICE_ID) res.setHeader("Strict-Transport-Security", "max-age=31536000");
   setCorsHeaders(req, res);
 
   if (req.method === "OPTIONS") {
@@ -1250,6 +1280,20 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === "/api/admin/login" && ["GET", "POST"].includes(req.method)) return await handleAdminLogin(req, res, url);
+    if (url.pathname === "/api/admin/logout" && req.method === "POST") {
+      const auth = adminAuthorized(req, url);
+      if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
+      adminAuth.logout(req, res);
+      res.writeHead(303, { Location: "/api/admin/login", "Cache-Control": "no-store" });
+      return res.end();
+    }
+    if (req.method === "GET" && ["/api/admin/orders", "/api/admin/stats"].includes(url.pathname)
+      && url.searchParams.get("format") !== "json" && !req.headers.authorization && !adminAuthorized(req, url).ok) {
+      res.writeHead(303, { Location: "/api/admin/login", "Cache-Control": "no-store" });
+      return res.end();
+    }
 
     if (req.method === "GET" && url.pathname === "/api/health") {
       return sendJson(res, 200, { ok: true, time: new Date().toISOString() });
@@ -1348,6 +1392,10 @@ const server = http.createServer(async (req, res) => {
     // laufen ausschliesslich ueber cancel-reservation, damit sie atomar und
     // wiederholbar mit dem Reservierungsstatus verknuepft bleiben.
     if (req.method === "GET" && url.pathname === "/api/admin/adjust-stock") {
+      res.setHeader("Allow", "POST");
+      return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    }
+    if (req.method === "POST" && url.pathname === "/api/admin/adjust-stock") {
       return await handleAdminAdjustStock(req, res, url);
     }
 

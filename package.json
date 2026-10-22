@@ -5,12 +5,13 @@
   "main": "src/server.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=20.6.0"
+    "node": "24.22.1"
   },
   "scripts": {
     "start": "node src/server.js",
     "seed": "node src/seedProducts.js",
-    "test:cancel": "node tests/cancel-reservation.cjs"
+    "test:cancel": "node tests/cancel-reservation.cjs",
+    "test:security": "node tests/security-auth.cjs"
   },
   "dependencies": {
     "pdfkit": "^0.15.0"
