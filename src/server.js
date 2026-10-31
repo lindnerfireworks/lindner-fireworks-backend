@@ -180,6 +180,9 @@ function adminAuthorized(req) {
 }
 
 function adminHtml(res, html) {
+  // Native form POSTs send Origin:null under no-referrer. Keep the real
+  // same-origin header for login/logout while suppressing off-site referrers.
+  res.setHeader("Referrer-Policy", "same-origin");
   const hashes = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
     .map(match => "'sha256-" + crypto.createHash("sha256").update(match[1]).digest("base64") + "'");
   res.setHeader("Content-Security-Policy", `default-src 'none'; script-src ${hashes.join(" ") || "'none'"}; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`);

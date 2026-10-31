@@ -28,12 +28,15 @@ async function stop(){if(child.exitCode===null){child.kill();await new Promise(r
   for(const route of ["/api/admin/backup","/api/admin/orders?format=json","/api/admin/stats?format=json"]){r=await request(route+(route.includes("?")?"&":"?")+"key="+key);check("query secret cannot authorize "+route,()=>assert.equal(r.status,401));}
   r=await request("/api/admin/orders?key="+key);check("old bookmark redirects without credential",()=>{assert.equal(r.status,303);assert.equal(r.headers.get("location"),"/api/admin/login");});
   r=await request("/api/admin/login");let html=await r.text();check("login page contains no credential and restrictive CSP",()=>{assert.equal(r.status,200);assert(!html.includes(key));assert.match(r.headers.get("content-security-policy"),/frame-ancestors 'none'/);assert.match(html,/type="password"/);});
+  check("login HTML preserves same-origin native form Origin",()=>assert.equal(r.headers.get("referrer-policy"),"same-origin"));
   r=await login(key,{Origin:"https://evil.example"});check("cross-origin login denied",()=>assert.equal(r.status,403));
   r=await login(key,{Origin:"null"});check("opaque origin login denied",()=>assert.equal(r.status,403));
   r=await login("wrong");check("invalid password denied",()=>assert.equal(r.status,401));
   r=await login(key);let cookie=r.headers.get("set-cookie");check("valid login issues protected opaque cookie",()=>{assert.equal(r.status,303);assert.match(cookie,/__Host-lindner-admin=[a-f0-9]{64}/);for(const flag of ["HttpOnly","Secure","SameSite=Strict","Path=/","Max-Age=28800"])assert(cookie.includes(flag));assert(!cookie.includes(key));});cookie=cookie.split(";")[0];
   r=await request("/api/admin/orders",{headers:{Cookie:cookie}});html=await r.text();check("session can read orders with hashed script CSP and no secrets",()=>{assert.equal(r.status,200);assert(html.includes("Synthetic"));assert(!html.includes(key));assert(!html.includes("location.search"));assert.match(r.headers.get("content-security-policy"),/script-src 'sha256-/);});
+  check("orders HTML preserves same-origin native form Origin",()=>assert.equal(r.headers.get("referrer-policy"),"same-origin"));
   r=await request("/api/admin/stats",{headers:{Cookie:cookie}});html=await r.text();check("stats links no longer contain admin key",()=>{assert.equal(r.status,200);assert(!html.includes(key));assert(!html.includes("?key="));});
+  check("stats HTML preserves same-origin native form Origin",()=>assert.equal(r.headers.get("referrer-policy"),"same-origin"));
   r=await request("/api/admin/backup",{headers:{Authorization:"Bearer "+key}});check("Bearer backup stays compatible",()=>assert.equal(r.status,200));
   r=await request("/api/abholschein/"+orderId);check("known order ID redirects to login without exposing owner PDF",()=>{assert.equal(r.status,303);assert.equal(r.headers.get("location"),"/api/admin/login?next="+encodeURIComponent("/api/abholschein/"+orderId));});
   r=await request(r.headers.get("location"));html=await r.text();check("PDF return path survives login form",()=>assert(html.includes('name="next" value="/api/abholschein/'+orderId+'"')));
