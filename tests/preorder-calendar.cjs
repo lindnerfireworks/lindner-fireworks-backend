@@ -11,8 +11,8 @@ const checks = [];
 function check(name, fn) { fn(); checks.push(name); }
 const pickup = require("../src/pickup");
 const cases = [
-  ["2026-10-13T12:00:00+02:00", "2026-11-06"],
-  ["2026-11-04T23:59:59+01:00", "2026-11-06"],
+  ["2026-10-13T12:00:00+02:00", "2026-11-07"],
+  ["2026-11-04T23:59:59+01:00", "2026-11-07"],
   ["2026-11-05T00:00:00+01:00", "2026-11-13"],
   ["2026-11-11T10:00:00+01:00", "2026-11-13"],
   ["2026-11-12T10:00:00+01:00", "2026-11-20"],
@@ -20,12 +20,18 @@ const cases = [
 for (const [now, first] of cases) check("Requested boundary " + now, () => {
   const options = pickup.pickupOptions(new Date(now));
   assert.equal(options[0].date, first);
-  assert.equal(options[0].timeWindow, "13:00–16:00 Uhr");
-  assert.equal(options[1].timeWindow, "09:00–12:00 Uhr");
+  assert(!options.some(option => option.date === "2026-11-06"));
+  for (const option of options.filter(option => option.kind === "regular")) {
+    const weekday = pickup.calendarDate(option.date).getUTCDay();
+    assert([5, 6].includes(weekday));
+    assert.equal(option.timeWindow, weekday === 5 ? "13:00–16:00 Uhr" : "09:00–12:00 Uhr");
+  }
 });
 check("Invalid dates and hard November lower bound", () => {
   assert.equal(pickup.calendarDate("2026-02-30"), null);
   assert.equal(pickup.slotForDay(new Date("2026-10-30T12:00Z")), null);
+  assert.equal(pickup.slotForDay(new Date("2026-11-06T12:00Z")), null);
+  assert.equal(pickup.slotForDay(new Date("2026-11-07T12:00Z")), "09:00–12:00 Uhr");
 });
 check("Daily December lead, closed days, end of season", () => {
   const options = pickup.pickupOptions(new Date("2026-12-25T10:00:00+01:00"));
@@ -89,7 +95,13 @@ function request(date, qty = 1) { return { requestId: crypto.randomUUID(), custo
     assert.equal(read("products.json").find(product => product.id === "shaolin-6").stock, 3);
   });
   const apiOptions = await (await fetch(running.base + "/api/pickup-options")).json();
-  check("Server-owned public API options and timezone", () => {assert.equal(apiOptions.timeZone,"Europe/Vienna");assert.equal(apiOptions.options[0].date,"2026-11-06");assert.equal(apiOptions.open,true);});
+  check("Server-owned public API options and timezone", () => {assert.equal(apiOptions.timeZone,"Europe/Vienna");assert.equal(apiOptions.firstPickupDay,"2026-11-07");assert.equal(apiOptions.options[0].date,"2026-11-07");assert.equal(apiOptions.open,true);});
+  const beforeClosedDay = ["products.json", "orders.json", "invoiceCounter.json", "mail.jsonl"].map(name => fs.readFileSync(path.join(data, name), "utf8"));
+  const closedDay = await post(request("2026-11-06"));
+  check("November 6 rejected before cutoff with no stock, order, counter or mail changes", () => {
+    assert.equal(closedDay.status,400);assert.equal(closedDay.body.error,"invalid_pickup_date");
+    assert.deepEqual(["products.json", "orders.json", "invoiceCounter.json", "mail.jsonl"].map(name => fs.readFileSync(path.join(data, name), "utf8")), beforeClosedDay);
+  });
   const invalid = await post(request("2026-10-30"));
   check("Direct API earlier pickup rejected without stock change", () => {assert.equal(invalid.status,400);assert.equal(invalid.body.error,"invalid_pickup_date");assert.equal(read("products.json").find(p=>p.id==="shaolin-6").stock,3);});
   const selectedRequest = request("2026-11-07", 2);
@@ -108,7 +120,7 @@ function request(date, qty = 1) { return { requestId: crypto.randomUUID(), custo
     assert.equal(retry.status,200);assert.equal(retry.body.duplicate,true);assert.equal(retry.body.order.id,created.body.order.id);
     assert.equal(retry.body.order.abholtermin,created.body.order.abholtermin);assert.equal(read("products.json").find(p=>p.id==="shaolin-6").stock,1);
   });
-  const tooEarly = await post({...request("2026-11-06"),createdAt:"2026-11-04T20:00Z",serverTime:"2026-11-04T20:00Z"});
+  const tooEarly = await post({...request("2026-11-07"),createdAt:"2026-11-04T20:00Z",serverTime:"2026-11-04T20:00Z"});
   check("Thursday cutoff cannot be bypassed with client time",()=>{assert.equal(tooEarly.status,400);assert.equal(tooEarly.body.error,"invalid_pickup_date");});
   const changed = await post({...selectedRequest,pickupDate:"2026-11-14"});
   check("Reused request ID with another date conflicts",()=>{assert.equal(changed.status,409);assert.equal(changed.body.error,"request_conflict");});

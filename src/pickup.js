@@ -1,7 +1,7 @@
 // One server-owned calendar for new reservations. Existing order appointments
 // are stored snapshots and must never be recomputed when reading/sending them.
 const TIME_ZONE = "Europe/Vienna";
-const FIRST_ALLOWED_DAY = "2026-11-06";
+const FIRST_ALLOWED_DAY = "2026-11-07";
 const LEAD_DAYS = Number(process.env.ORDER_LEAD_DAYS || 2);
 const configuredFirstDay = process.env.PICKUP_FIRST_DAY || FIRST_ALLOWED_DAY;
 const PICKUP_FIRST_DAY = configuredFirstDay < FIRST_ALLOWED_DAY ? FIRST_ALLOWED_DAY : configuredFirstDay;

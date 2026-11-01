@@ -3,7 +3,7 @@
 Stand 13.10.2026. Online wird unverbindlich reserviert; Kaufabschluss und Zahlung erfolgen vor Ort.
 
 - `ORDERS_OPEN_FROM=` (bewusst leer) erlaubt Reservierungen sofort; diese Einstellung ist unabhängig vom Abholkalender. `ORDERS_OPEN_UNTIL=2027-01-01` bleibt erhalten.
-- Erste mögliche Abholung: Freitag 06.11.2026 13–16 Uhr oder Samstag 07.11.2026 09–12 Uhr.
+- Erste mögliche Abholung: Samstag 07.11.2026 09–12 Uhr. Der 06.11.2026 ist für neue Abholtermine ausgeschlossen; bereits gespeicherte Reservierungen werden nicht geändert.
 - Für reguläre Freitag-/Samstagstermine zählt der Eingang am Server in Europe/Vienna: bis Mittwoch Tagesende dasselbe Wochenende; ab Donnerstag das Wochenende der Folgewoche. Spätere Termine sind wählbar.
 - Sondertermine 27.–31.12. täglich 08–12 Uhr verwenden weiterhin `ORDER_LEAD_DAYS` (Standard zwei Kalendertage). 24.–26.12. geschlossen; letzte Abholung 31.12. Keine reservierbare Abholung nach Saisonende.
 - `GET /api/pickup-options` liefert die maßgebliche Terminliste samt Serverzeit. `POST /api/order` prüft `pickupDate` erneut. Clientzeit ist ohne Bedeutung. Alte Clients ohne Termin erhalten den ersten gültigen Termin.
