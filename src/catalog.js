@@ -14,6 +14,7 @@
 // Stand: 2026-09-30
 
 const CATALOG = [
+  { id: "exodus", name: "Exodus", price: 165.90 },
   { id: "shaolin-6", name: "Shaolin 6", price: 109.90 },
   { id: "aidos", name: "Aidos", price: 4.20 },
   { id: "gigant-2", name: "Gigant 2", price: 4.70 },

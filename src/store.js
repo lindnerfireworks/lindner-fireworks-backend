@@ -154,9 +154,13 @@ async function initialize() {
     let productAdded = false;
     if (!products.some(product => product.id === "shaolin-6")) {
       products.push({ id: "shaolin-6", name: "Shaolin 6", stock: 3 });
-      await writeJson(PRODUCTS_FILE, products);
       productAdded = true;
     }
+    if (!products.some(product => product.id === "exodus")) {
+      products.push({ id: "exodus", name: "Exodus", stock: 1 });
+      productAdded = true;
+    }
+    if (productAdded) await writeJson(PRODUCTS_FILE, products);
     return { recovered: Boolean(journal), transactionId: journal?.transactionId || null, productAdded };
   }));
 }

@@ -35,6 +35,7 @@ const SEED_PRODUCTS = [
   { id: "monster", name: "Monster", stock: 4 },
   // Verbundfeuerwerk
   { id: "shaolin-6", name: "Shaolin 6", stock: 3 },
+  { id: "exodus", name: "Exodus", stock: 1 },
   { id: "wilk", name: "Wilk", stock: 3 },
   { id: "pyroshow-1000-c-cimelia", name: "Pyroshow 1000-C Cimelia", stock: 2 },
   { id: "okazja", name: "Okazja", stock: 4 },
