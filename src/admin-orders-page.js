@@ -35,6 +35,43 @@ function packingTime(value) {
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("de-AT", { timeZone: "Europe/Vienna" });
 }
 
+function isCancelled(order) {
+  return order.status === "cancelled" || Boolean(order.cancelledAt);
+}
+
+function ordersFilterClient() {
+  const toggle = document.querySelector("#show-cancelled");
+  if (!toggle) return;
+  const groups = document.querySelectorAll(".day");
+  const summary = document.querySelector("#orders-summary");
+  const empty = document.querySelector("#orders-empty");
+  const formatSummary = (count, sum) => `${count} ${count === 1 ? "Reservierung" : "Reservierungen"} · ${sum.toFixed(2).replace(".", ",")} €`;
+  const applyFilter = () => {
+    const includeCancelled = toggle.checked;
+    let total = 0;
+    let sum = 0;
+    groups.forEach(group => {
+      group.querySelectorAll(".order").forEach(row => {
+        row.hidden = !includeCancelled && row.dataset.cancelled === "true";
+      });
+      const count = Number(includeCancelled ? group.dataset.allCount : group.dataset.activeCount);
+      const groupSum = Number(includeCancelled ? group.dataset.allSum : group.dataset.activeSum);
+      group.hidden = count === 0;
+      group.querySelector(".daymeta").textContent = formatSummary(count, groupSum);
+      total += count;
+      sum += groupSum;
+    });
+    summary.textContent = `${formatSummary(total, sum)} gesamt`;
+    empty.hidden = total > 0;
+    empty.textContent = includeCancelled ? "Noch keine Reservierungen." : "Keine nicht stornierten Reservierungen vorhanden.";
+  };
+  // Always start with the compact view, including after a browser restores form state.
+  toggle.checked = false;
+  toggle.disabled = false;
+  applyFilter();
+  toggle.addEventListener("change", applyFilter);
+}
+
 // Static client source: no customer data or server credential is embedded here.
 function packingClient() {
   const rows = document.querySelectorAll(".order");
@@ -122,6 +159,11 @@ function packingClient() {
 
 function renderOrdersPage(groups, { total, umsatz, filterTag }) {
   const heute = new Date().toLocaleDateString("de-AT", { timeZone: "Europe/Vienna" });
+  const allOrders = groups.flatMap(group => group.orders);
+  const activeOrders = allOrders.filter(order => !isCancelled(order));
+  const cancelledCount = allOrders.length - activeOrders.length;
+  const visibleTotal = activeOrders.length;
+  const visibleSum = activeOrders.reduce((amount, order) => amount + Number(order.total || 0), 0);
   let index = 0;
   const gruppenHtml = groups.map(group => {
     const ordersHtml = group.orders.map(order => {
@@ -135,7 +177,7 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
         ? `<a href="tel:${esc(String(order.customerPhone).replace(/\s/g, ""))}">${esc(order.customerPhone)}</a>`
         : '<span class="muted">keine Nummer</span>';
       const feedback = !packable ? `${state.label} · gesperrt` : packed ? "Gepackt" : "Noch nicht gepackt";
-      return `<article class="order ${state.className}">
+      return `<article class="order ${state.className}" data-cancelled="${isCancelled(order)}"${isCancelled(order) ? " hidden" : ""}>
         <details class="order-details">
           <summary><span class="name">${esc(order.customerName || "Ohne Namen")}</span><span class="chevron" aria-hidden="true">›</span></summary>
           <div class="order-content">
@@ -154,7 +196,9 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
       </article>`;
     }).join("");
     const sum = group.orders.reduce((amount, order) => amount + Number(order.total || 0), 0);
-    return `<section class="day"><h2>${esc(group.label)}</h2><p class="daymeta">${group.orders.length} ${group.orders.length === 1 ? "Reservierung" : "Reservierungen"} · ${euro(sum)}</p>${ordersHtml}</section>`;
+    const active = group.orders.filter(order => !isCancelled(order));
+    const activeSum = active.reduce((amount, order) => amount + Number(order.total || 0), 0);
+    return `<section class="day" data-all-count="${group.orders.length}" data-all-sum="${sum}" data-active-count="${active.length}" data-active-sum="${activeSum}"${active.length ? "" : " hidden"}><h2>${esc(group.label)}</h2><p class="daymeta">${active.length} ${active.length === 1 ? "Reservierung" : "Reservierungen"} · ${euro(activeSum)}</p>${ordersHtml}</section>`;
   }).join("");
 
   return `<!DOCTYPE html>
@@ -170,6 +214,9 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
   body { margin:0; padding:16px; background:#28418c; color:#eef1fb; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:16px; }
   h1 { font-size:21px; margin:0 0 2px; }
   .meta { color:#cdd3f2; font-size:14px; margin-bottom:20px; overflow-wrap:anywhere; }
+  [hidden] { display:none !important; }
+  .orders-filter { display:flex; align-items:center; gap:9px; min-height:44px; margin:0 0 18px; font-size:14px; cursor:pointer; }
+  .orders-filter input { width:20px; height:20px; margin:0; accent-color:#72f2bf; }
   .day { margin-bottom:26px; }
   .day h2 { font-size:17px; margin:0 0 2px; color:#72f2bf; overflow-wrap:anywhere; }
   .daymeta { margin:0 0 10px; font-size:13px; color:#cdd3f2; }
@@ -208,10 +255,12 @@ function renderOrdersPage(groups, { total, umsatz, filterTag }) {
 <main>
   <h1>Reservierungen</h1>
   <form method="post" action="/api/admin/logout"><button type="submit">Abmelden</button></form>
-  <p class="meta">Stand ${esc(heute)} · ${esc(total)} ${total === 1 ? "Reservierung" : "Reservierungen"} · ${euro(umsatz)} gesamt${filterTag ? `<br>Gefiltert auf ${esc(filterTag)}` : ""}</p>
-  ${gruppenHtml || '<div class="empty">Noch keine Reservierungen.</div>'}
+  <p class="meta">Stand ${esc(heute)} · <span id="orders-summary" role="status" aria-live="polite">${visibleTotal} ${visibleTotal === 1 ? "Reservierung" : "Reservierungen"} · ${euro(visibleSum)} gesamt</span>${filterTag ? `<br>Gefiltert auf ${esc(filterTag)}` : ""}</p>
+  ${cancelledCount ? `<label class="orders-filter"><input type="checkbox" id="show-cancelled" disabled>Stornierte anzeigen (${cancelledCount})</label><noscript><p class="muted">Zum Einblenden stornierter Reservierungen bitte JavaScript aktivieren.</p></noscript>` : ""}
+  ${gruppenHtml}
+  <div class="empty" id="orders-empty"${visibleTotal ? " hidden" : ""}>${cancelledCount ? "Keine nicht stornierten Reservierungen vorhanden." : "Noch keine Reservierungen."}</div>
 </main>
-<script>(${packingClient.toString()})();</script>
+<script>(${ordersFilterClient.toString()})();(${packingClient.toString()})();</script>
 </body>
 </html>`;
 }
